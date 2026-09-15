@@ -1,0 +1,706 @@
+====================================================================
+INVENTORY-SERVICE — FULL BEGINNER EXPLANATION OF EVERY FILE AND ANNOTATION
+====================================================================
+
+This file explains, in plain language, every class and every annotation
+used in inventory-service, so you can learn what Spring Boot / JPA /
+Hibernate / RabbitMQ are actually doing under the hood.
+
+Inventory-service's job (per the project spec, "Modul Katalog i Zalihe"):
+manage the article catalog, track stock per warehouse, receive goods
+from suppliers, and handle the "reserve stock" side of the Saga pattern
+used across the whole system.
+
+If you haven't already, read BILLING_SERVICE_EXPLAINED.txt first (in the
+billing-service folder) - it explains the basic Spring/JPA concepts
+(@Entity, @Service, @RestController, @Transactional, dependency injection,
+etc.) in more depth. This file assumes you already understand those
+basics and focuses on what's NEW or DIFFERENT in inventory-service.
+
+
+====================================================================
+1. THE OVERALL SHAPE OF THIS SERVICE (LAYERED ARCHITECTURE)
+====================================================================
+
+Same layered architecture as billing-service, just with more classes
+because inventory-service does more:
+
+    controller/   -> InventoryController.java              (1 file)
+    service/      -> InventoryService.java                  (1 file)
+    repository/   -> 5 repository interfaces
+    entity/       -> 7 JPA entities/enums
+    dto/          -> 5 REST request/response DTOs
+    messaging/    -> 7 message DTOs + InventoryPublisher + InventoryConsumer
+    config/       -> RabbitMQConfig.java
+    (root)        -> InventoryServiceApplication.java
+
+Total: 30 files. The extra complexity compared to billing-service comes
+from: (a) more database tables (items, stock, receptions, reservations,
+dispatch notes), and (b) inventory-service both PUBLISHES and CONSUMES
+RabbitMQ messages (billing-service only publishes).
+
+
+====================================================================
+2. InventoryServiceApplication.java  (entry point)
+====================================================================
+
+@SpringBootApplication
+public class InventoryServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(InventoryServiceApplication.class, args);
+    }
+}
+
+Identical role to BillingServiceApplication - starts the embedded web
+server (Tomcat, on port 8081 per application.properties), scans the
+package for @Component/@Service/@RestController/@Configuration classes,
+and wires everything together automatically.
+
+
+====================================================================
+3. ENTITIES (entity/ folder) — the database tables, as Java classes
+====================================================================
+
+--------------------------------------------------------------------
+3.1 Item.java
+--------------------------------------------------------------------
+@Entity
+@Table(name = "items")
+public class Item {
+    @Id
+    @Column(name = "item_code", nullable = false, unique = true, length = 50)
+    private String itemCode;
+
+    private String name;
+    private String unitOfMeasure;
+    private boolean active = true;
+}
+
+- The primary key (@Id) here is a String business code like "ITEM001",
+  NOT an auto-generated number. This is different from most other
+  entities in this project. Whoever calls the newItem() REST endpoint
+  supplies this code themselves - there's no @GeneratedValue here.
+- "active" is a soft-delete flag (spec: "aktivan/neaktivan") - items are
+  never physically deleted from the table, just flagged inactive.
+
+--------------------------------------------------------------------
+3.2 WarehouseStock.java
+--------------------------------------------------------------------
+@Entity
+@Table(name = "warehouse_stock", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"warehouse_code", "item_code"})
+})
+public class WarehouseStock {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String warehouseCode;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "item_code", nullable = false)
+    private Item item;
+
+    private BigDecimal totalQuantity = BigDecimal.ZERO;
+    private BigDecimal reservedQuantity = BigDecimal.ZERO;
+
+    public BigDecimal getAvailableQuantity() {
+        return totalQuantity.subtract(reservedQuantity);
+    }
+}
+
+- One row per (warehouse, item) combination. This is the entity the
+  whole Saga reservation logic reads and writes.
+- @UniqueConstraint(columnNames = {"warehouse_code", "item_code"}):
+  a DATABASE-LEVEL rule saying "never allow two rows with the same
+  warehouse+item pair" - enforced by PostgreSQL itself, not just Java code.
+- @ManyToOne(fetch = FetchType.LAZY): this is a NEW annotation type not
+  in billing-service. It means: "many WarehouseStock rows can point to
+  one Item". FetchType.LAZY means Hibernate does NOT load the full Item
+  object from the database until someone actually calls getItem() on
+  this WarehouseStock - it avoids an unnecessary extra query when you
+  don't need the item's details.
+- @JoinColumn(name = "item_code"): the actual foreign-key column name
+  in the warehouse_stock table that points back to items.item_code.
+- getAvailableQuantity() is NOT stored in the database at all - it's
+  just calculated on the fly every time it's called (total minus
+  reserved). This is a normal Java method, nothing to do with JPA.
+- BigDecimal (not double/float) is used for ALL quantities and money in
+  this whole project, everywhere, to avoid floating-point rounding
+  errors - standard practice for anything financial or quantity-based.
+
+--------------------------------------------------------------------
+3.3 GoodsReception.java  and  3.4 GoodsReceptionItem.java
+--------------------------------------------------------------------
+These two form a classic "header / detail" (or "master / detail") pair -
+one document (the reception) has many line items (which article, how
+much, at what price).
+
+GoodsReception (the "header"):
+    @OneToMany(mappedBy = "reception", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<GoodsReceptionItem> items = new ArrayList<>();
+
+- @OneToMany: "one GoodsReception has many GoodsReceptionItem rows".
+- mappedBy = "reception": points to the FIELD NAME on the OTHER class
+  (GoodsReceptionItem.reception) that actually owns the foreign key
+  column. This side (GoodsReception) is just the "parent's view" of the
+  relationship - it doesn't have its own foreign key column.
+- cascade = CascadeType.ALL: saving or deleting this GoodsReception
+  automatically saves/deletes all of its GoodsReceptionItem rows too, in
+  one call.
+- orphanRemoval = true: if you remove an item from this Java list, its
+  database row gets deleted too (it would otherwise become an "orphan"
+  row with no parent).
+
+GoodsReceptionItem (the "detail" / owning side):
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "reception_id", nullable = false)
+    private GoodsReception reception;
+
+    private BigDecimal purchasePrice;
+
+- This side IS the "owning side" - it actually HOLDS the reception_id
+  foreign key column in its database table.
+- purchasePrice here is the source of truth for orders-service's
+  weighted-average purchase price calculation (sent via the
+  StockReplenished event, explained in the messaging section below).
+
+--------------------------------------------------------------------
+3.5 StockReservation.java
+--------------------------------------------------------------------
+@Entity
+@Table(name = "stock_reservations")
+public class StockReservation {
+    private String shipmentRequestId;
+    private String warehouseCode;
+    @ManyToOne private Item item;
+    private BigDecimal reservedQuantity;
+}
+
+- Records exactly which warehouse+item+quantity was reserved for a given
+  ShipmentRequest (identified by shipmentRequestId - a plain String).
+- IMPORTANT: shipmentRequestId is NOT a foreign key to another table in
+  THIS service's database - it's an id that actually lives in
+  orders-service's SEPARATE database. Cross-service references like this
+  (just storing the other service's id as plain data, with no real
+  database-level foreign key) are completely normal in microservices,
+  where each service owns its own isolated database.
+- This entity is the "memory" that makes cancelReservation() and
+  processGoodsSold() (in InventoryService, explained below) possible
+  later, without having to redo all the reservation math again.
+
+--------------------------------------------------------------------
+3.6 DispatchNote.java  and  3.7 DispatchNoteStatus.java
+--------------------------------------------------------------------
+@Entity
+@Table(name = "dispatch_notes")
+public class DispatchNote {
+    private String shipmentRequestId;
+    private String warehouseCode;
+    @ManyToOne private Item item;
+    private BigDecimal quantity;
+
+    @Enumerated(EnumType.STRING)
+    private DispatchNoteStatus status = DispatchNoteStatus.READY_FOR_DISPATCH;
+
+    private LocalDateTime createdAt = LocalDateTime.now();
+}
+
+public enum DispatchNoteStatus {
+    READY_FOR_DISPATCH,
+    DISPATCHED
+}
+
+- The "otpremnica" from the project spec. Created only once goods are
+  actually SOLD/PAID for (see InventoryService.processGoodsSold below) -
+  this is the final, permanent proof that stock physically left the
+  warehouse, as opposed to StockReservation which is only a temporary
+  "hold".
+- ENUM (public enum DispatchNoteStatus): a Java language feature (not
+  JPA-specific) - a fixed, small set of named constants. Using an enum
+  instead of a plain String field makes invalid values (like a typo
+  "REDY_FOR_DISPATCH") IMPOSSIBLE - the Java compiler enforces that only
+  these two exact values can ever exist.
+- @Enumerated(EnumType.STRING): tells Hibernate to store the enum's NAME
+  ("READY_FOR_DISPATCH") as readable text in the database column, instead
+  of just a number (its "ordinal position", 0 or 1). ALWAYS prefer STRING
+  over the ORDINAL alternative: if you ever reorder the enum's values
+  later, ORDINAL storage would silently corrupt all your old data,
+  STRING storage never does.
+
+
+====================================================================
+4. REPOSITORIES (repository/ folder) — 5 files
+====================================================================
+
+All 5 are interfaces extending JpaRepository<EntityType, IdType> exactly
+like PaymentRepository in billing-service - Spring Data JPA generates the
+real implementation automatically, no SQL written by hand for basic CRUD.
+
+ItemRepository extends JpaRepository<Item, String>
+  - No extra methods. "String" matches Item's @Id type (itemCode).
+
+WarehouseStockRepository extends JpaRepository<WarehouseStock, Long>
+  - List<WarehouseStock> findByItem(Item item);
+    Parsed by Spring as "find ... By Item" -> generates:
+    SELECT * FROM warehouse_stock WHERE item_code = ?
+  - Optional<WarehouseStock> findByWarehouseCodeAndItem(String warehouseCode, Item item);
+    Parsed as "find ... By WarehouseCode And Item" ->
+    SELECT * FROM warehouse_stock WHERE warehouse_code = ? AND item_code = ?
+    Optional<T> forces the calling code to explicitly handle the
+    "nothing found" case instead of risking a NullPointerException.
+
+GoodsReceptionRepository extends JpaRepository<GoodsReception, Long>
+  - No extra methods needed - just saving the reception "paper trail".
+
+StockReservationRepository extends JpaRepository<StockReservation, Long>
+  - List<StockReservation> findByShipmentRequestId(String shipmentRequestId);
+    Used to fetch every reservation row tied to one Saga/ShipmentRequest
+    at once, when cancelling or finalizing it.
+
+DispatchNoteRepository extends JpaRepository<DispatchNote, Long>
+  - Same pattern, kept for potential future use.
+
+
+====================================================================
+5. DTOs (dto/ folder) — 5 files, REST request/response shapes
+====================================================================
+
+Same DTO concept as billing-service's PayShipmentRequest: plain classes,
+no logic, used ONLY to define exact JSON shapes for REST endpoints.
+
+NewItemRequest        - body for POST /api/inventory/items (itemCode, name, unitOfMeasure)
+ReceptionRequest      - body for POST /api/inventory/reception (date, supplierCode,
+                        warehouseCode, list of ReceptionItemRequest)
+ReceptionItemRequest  - one line inside ReceptionRequest.items[]
+                        (itemCode, quantity, unitOfMeasure, purchasePrice)
+ItemResponse          - what GET /api/inventory/items returns per item
+WarehouseStockResponse - what GET /api/inventory/items/{code}/state returns per warehouse
+
+Note ReceptionRequest uses:
+    @JsonFormat(pattern = "yyyy-MM-dd")
+    private LocalDate date;
+exactly like billing-service's PayShipmentRequest, for the same reason
+(tell Jackson exactly how to parse the date string).
+
+ItemResponse and WarehouseStockResponse both have TWO constructors: an
+empty one (required by Jackson) and a "full" one taking all fields at
+once (a convenience for our own code in InventoryService, so we can
+build the response object in one line instead of many setter calls).
+
+
+====================================================================
+6. MESSAGING (messaging/ folder) — the RabbitMQ side of this service
+====================================================================
+
+This folder has 3 kinds of classes:
+  (a) 7 plain message DTO classes (like REST DTOs, but sent over RabbitMQ)
+  (b) InventoryPublisher - the ONLY class that SENDS messages
+  (c) InventoryConsumer  - the ONLY class that RECEIVES messages
+
+--------------------------------------------------------------------
+6.1 The 7 message DTO classes
+--------------------------------------------------------------------
+
+ItemCreatedEvent
+  Sent AFTER newItem() succeeds. Lets orders-service keep its own local
+  copy of the item catalog in sync (microservices don't share a
+  database, so each side needs its own copy of data it depends on).
+
+StockReplenishedEvent (has a nested static class ReplenishedItem)
+  Sent AFTER receptionOfGoods() succeeds. Contains the purchasePrice for
+  each item - this is how orders-service learns purchase prices, needed
+  for its "selling price = purchase price * (1 + margin)" calculation.
+  A "nested static class" (ReplenishedItem defined INSIDE
+  StockReplenishedEvent) is just a Java organizational feature - used
+  here because "ReplenishedItem" only makes sense in the context of one
+  specific StockReplenishedEvent, so it's kept scoped inside it.
+
+ReserveStockMessage (has a nested StockItem class)
+  RECEIVED BY inventory-service (sent by orders-service). This is Saga
+  step 1: "please reserve this quantity of these items for this
+  shipmentRequestId". Field names/types must match EXACTLY between this
+  class and orders-service's OWN separate copy of the same class -
+  there's no shared code module between the two Maven projects, only a
+  shared JSON "shape" kept in sync by developer discipline.
+
+StockReservedEvent (has a nested ReservationDetail class)
+  SENT BY inventory-service back to orders-service - Saga step 2,
+  SUCCESS path. "reservations" can list MULTIPLE lines because one
+  item's requested quantity might get split across several different
+  warehouses (see the greedy algorithm in InventoryService.reserveStock,
+  explained below).
+
+StockReservationFailedEvent
+  SENT BY inventory-service back to orders-service - Saga step 2,
+  FAILURE path. Triggers orders-service's "compensating transaction"
+  (cancelling its own ShipmentRequest, since Inventory couldn't fulfill it).
+
+CancelReservationMessage
+  RECEIVED BY inventory-service. Sent either by orders-service's daily
+  scheduled expiry job, or as a manual compensation - "please release
+  this reservation, the units were never actually shipped."
+
+GoodsSoldMessage (has a nested SoldItem class)
+  RECEIVED BY inventory-service, sent by orders-service after Billing
+  confirms payment. This is the LAST step of the whole business flow -
+  triggers inventory-service to permanently remove stock and create
+  DispatchNote(s).
+
+--------------------------------------------------------------------
+6.2 InventoryPublisher.java
+--------------------------------------------------------------------
+@Component
+public class InventoryPublisher {
+    private final RabbitTemplate rabbitTemplate;
+
+    public void publishItemCreated(ItemCreatedEvent event) {
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_ITEM_CREATED, event);
+    }
+    // ... 3 more publishXxx methods, one per outgoing event type
+}
+
+Same exact role and pattern as BillingPublisher in billing-service - the
+one class allowed to send messages, using the injected RabbitTemplate
+bean, into the shared "wms.topic.exchange" with a specific routing key
+per message type.
+
+--------------------------------------------------------------------
+6.3 InventoryConsumer.java  (NEW - billing-service has no equivalent!)
+--------------------------------------------------------------------
+@Component
+public class InventoryConsumer {
+    private final InventoryService inventoryService;
+
+    @RabbitListener(queues = RabbitMQConfig.Q_RESERVE_STOCK)
+    public void handleReserveStock(ReserveStockMessage message) {
+        inventoryService.reserveStock(message);
+    }
+
+    @RabbitListener(queues = RabbitMQConfig.Q_CANCEL_RESERVATION)
+    public void handleCancelReservation(CancelReservationMessage message) {
+        inventoryService.cancelReservation(message.getShipmentRequestId());
+    }
+
+    @RabbitListener(queues = RabbitMQConfig.Q_GOODS_SOLD)
+    public void handleGoodsSold(GoodsSoldMessage message) {
+        inventoryService.processGoodsSold(message);
+    }
+}
+
+WHAT IS THIS?
+This is the "receiving" counterpart to InventoryPublisher - it RECEIVES
+messages from RabbitMQ instead of sending them. Billing-service has NO
+equivalent class because billing-service never listens to any queue -
+it only ever publishes.
+
+ANNOTATION: @RabbitListener(queues = ...)
+  Tells Spring AMQP: "run this method automatically, on a background
+  thread, whenever a message lands in this specific queue". You NEVER
+  call these methods yourself anywhere in your own code - Spring invokes
+  them for you, completely asynchronously, whenever RabbitMQ delivers a
+  message.
+- The method's PARAMETER TYPE (e.g. ReserveStockMessage) tells Jackson
+  exactly what Java class to convert the incoming JSON bytes into.
+- Each method just immediately delegates the real work to
+  InventoryService - the Consumer class itself contains no business
+  logic, same "thin layer" principle as the REST controller.
+
+
+====================================================================
+7. config/RabbitMQConfig.java
+====================================================================
+
+Same overall structure as billing-service's RabbitMQConfig, but with
+MORE routing keys and queues, because this service both publishes AND
+consumes multiple message types:
+
+    public static final String EXCHANGE = "wms.topic.exchange";  // SAME exchange name shared by all 3 services!
+
+    // Routing keys for outgoing events (this service is the SENDER)
+    RK_ITEM_CREATED, RK_STOCK_REPLENISHED, RK_STOCK_RESERVED, RK_STOCK_RESERVATION_FAILED
+
+    // Routing keys for incoming messages (this service is the RECEIVER)
+    RK_RESERVE_STOCK, RK_CANCEL_RESERVATION, RK_GOODS_SOLD
+
+    // Queue names - THIS service's own queues (only needed for what it CONSUMES)
+    Q_RESERVE_STOCK, Q_CANCEL_RESERVATION, Q_GOODS_SOLD
+
+    @Bean public Queue reserveStockQueue() { return new Queue(Q_RESERVE_STOCK, true); }
+    // ... etc, one Queue @Bean per incoming message type
+
+    @Bean
+    public Binding bindReserveStock(Queue reserveStockQueue, TopicExchange exchange) {
+        return BindingBuilder.bind(reserveStockQueue).to(exchange).with(RK_RESERVE_STOCK);
+    }
+    // ... etc, one Binding @Bean per queue
+
+NEW CONCEPTS vs billing-service (which only had the exchange + converter
++ RabbitTemplate, no queues/bindings of its own):
+
+- Queue (new Queue(name, durable=true)):
+  Represents an actual RabbitMQ queue - where messages wait until a
+  @RabbitListener method reads them. "durable=true" means the queue
+  survives a RabbitMQ broker restart (gets automatically redeclared by
+  Spring on next startup if it's missing).
+
+- Binding (BindingBuilder.bind(queue).to(exchange).with(routingKey)):
+  The RULE that connects "if a message arrives at this exchange with
+  this exact routing key, deliver a copy of it into this queue". Without
+  a binding, messages published to the exchange would just be silently
+  dropped - nobody would ever receive them.
+
+- SimpleRabbitListenerContainerFactory bean:
+  This is the piece of infrastructure that actually POWERS every
+  @RabbitListener method in InventoryConsumer - it's the "receiving"
+  counterpart to RabbitTemplate (which powers SENDING in
+  InventoryPublisher). Billing-service doesn't need this bean at all,
+  since it has no @RabbitListener methods anywhere.
+
+The Jackson2JsonMessageConverter / TypePrecedence.INFERRED setup here is
+identical to billing-service's - same reasoning (avoid trying to look up
+the sender's exact Java class name on this service's classpath, since
+each microservice keeps its own separate copy of message classes).
+
+
+====================================================================
+8. controller/InventoryController.java  (REST LAYER)
+====================================================================
+
+@RestController
+@RequestMapping("/api/inventory")
+public class InventoryController {
+
+    @GetMapping("/items")
+    public ResponseEntity<List<ItemResponse>> getAllItems() { ... }
+
+    @GetMapping("/items/{itemCode}/state")
+    public ResponseEntity<List<WarehouseStockResponse>> getItemState(@PathVariable String itemCode) { ... }
+
+    @PostMapping("/items")
+    public ResponseEntity<Void> newItem(@RequestBody NewItemRequest request) { ... }
+
+    @PostMapping("/reception")
+    public ResponseEntity<Void> receptionOfGoods(@RequestBody ReceptionRequest request) { ... }
+}
+
+Same "thin controller, just forwards to the service layer" pattern as
+BillingController. The one NEW annotation here compared to billing-service:
+
+ANNOTATION: @PathVariable
+  Used on getItemState(@PathVariable String itemCode). The
+  "{itemCode}" inside @GetMapping("/items/{itemCode}/state") is a URL
+  TEMPLATE VARIABLE - @PathVariable tells Spring "take whatever text
+  appears in that exact position of the URL, and pass it as this method
+  parameter". So a request to
+      GET /api/inventory/items/ITEM001/state
+  automatically gives you itemCode = "ITEM001" inside the method.
+
+
+====================================================================
+9. service/InventoryService.java  (THE CORE BUSINESS LOGIC)
+====================================================================
+
+This is the biggest and most important class in inventory-service. It
+implements the actual Saga "Inventory side" logic. Six public methods:
+
+--------------------------------------------------------------------
+9.1 getAllItems() / getItemState(itemCode)   -- simple reads
+--------------------------------------------------------------------
+No @Transactional here - these are pure reads, nothing gets modified, so
+there's nothing that needs to be committed or rolled back.
+
+--------------------------------------------------------------------
+9.2 newItem(request)
+--------------------------------------------------------------------
+@Transactional
+public void newItem(NewItemRequest request) {
+    if (itemRepository.existsById(request.getItemCode())) {
+        throw new IllegalArgumentException("Item already exists: ...");
+    }
+    Item item = new Item();
+    ... set fields ...
+    itemRepository.save(item);
+    publisher.publishItemCreated(new ItemCreatedEvent(...));
+}
+
+Straightforward: validate uniqueness, save, then broadcast an event so
+other services can react. @Transactional here means: if
+publishItemCreated() somehow failed, the item.save() above would be
+rolled back too - "all or nothing" for the whole method.
+
+--------------------------------------------------------------------
+9.3 receptionOfGoods(request)
+--------------------------------------------------------------------
+For each line item in the request:
+  - looks up the Item (throws if not found)
+  - builds a GoodsReceptionItem and adds it to the GoodsReception's list
+  - finds the existing WarehouseStock row for (warehouse, item), or
+    creates a brand new one if this is the first time this item arrives
+    at this specific warehouse (a common pattern called "upsert" -
+    UPDATE if it exists, INSERT if it doesn't)
+  - increases totalQuantity by the received amount
+Then saves the whole GoodsReception (cascading saves all its items too),
+and publishes ONE StockReplenishedEvent containing ALL the received
+lines at once.
+
+--------------------------------------------------------------------
+9.4 reserveStock(message)  --  THE MOST COMPLEX METHOD IN THE PROJECT
+--------------------------------------------------------------------
+This is the "Inventory side" of Saga step 1, triggered by
+InventoryConsumer.handleReserveStock - never called directly by any
+controller.
+
+THE ALGORITHM (a "greedy" strategy):
+  For each requested item:
+    - look up ALL WarehouseStock rows for that item (could be several,
+      one per warehouse that carries it)
+    - walk through them one by one, taking as much as possible from each
+      warehouse until the full requested quantity is covered
+    - this is what allows one item's quantity to be SPLIT ACROSS
+      MULTIPLE WAREHOUSES automatically
+
+WHY IS THERE A "pendingReservations" MAP?
+  Because within ONE single call to reserveStock(), the SAME warehouse
+  row might get partially used up MULTIPLE times (e.g. two different
+  order lines both need stock from the same warehouse). If we only
+  checked the database's current "available" value each time, we could
+  accidentally "double-spend" the same units before anything is actually
+  saved. The pendingReservations map keeps a running tally in memory of
+  exactly how much has ALREADY been earmarked in this one method call,
+  so the "true available" calculation always accounts for it.
+
+WHY DOES IT RETURN EARLY INSTEAD OF THROWING AN EXCEPTION ON FAILURE?
+  If ANY requested item can't be fully covered, the method calls
+  publisher.publishStockReservationFailed(...) and then just `return`s.
+  Nothing was actually save()'d to the database yet at that point (only
+  added to in-memory Java lists) - so there's nothing for @Transactional
+  to roll back, and returning early simply skips the "commit" section
+  further down that would otherwise write everything to the database.
+
+ON SUCCESS:
+  Every affected WarehouseStock row gets its reservedQuantity increased,
+  a StockReservation "memory" row is created for each line, and finally
+  ONE StockReservedEvent is published listing every warehouse/item/qty
+  combination that got reserved.
+
+--------------------------------------------------------------------
+9.5 cancelReservation(shipmentRequestId)
+--------------------------------------------------------------------
+The Saga's "undo" for the reservation step. Finds all StockReservation
+rows for this shipmentRequestId, subtracts each one's quantity back out
+of reservedQuantity (NOT totalQuantity - the goods never actually left
+the warehouse, they were just "on hold"), then deletes the
+StockReservation rows since they're no longer needed.
+
+--------------------------------------------------------------------
+9.6 processGoodsSold(message)
+--------------------------------------------------------------------
+Called only after Billing has confirmed payment (relayed via
+orders-service's GoodsSold message). This is where stock ACTUALLY,
+PERMANENTLY leaves the warehouse: for each reservation, BOTH
+totalQuantity AND reservedQuantity get reduced (unlike cancelReservation,
+which only touches reservedQuantity), and a DispatchNote is created with
+status READY_FOR_DISPATCH as proof the goods are ready to physically ship.
+
+
+====================================================================
+10. QUICK-REFERENCE: NEW ANNOTATIONS NOT COVERED IN BILLING_SERVICE_EXPLAINED.TXT
+====================================================================
+
+@ManyToOne(fetch = FetchType.LAZY)  - "many rows of THIS entity point to
+                                       one row of ANOTHER entity"; LAZY =
+                                       don't load it until actually accessed
+@OneToMany(mappedBy = "...")        - the "parent" side of a one-to-many
+                                       relationship; doesn't own the FK column
+@JoinColumn(name = "...")           - names the actual foreign-key column
+@UniqueConstraint(columnNames={...}) - a multi-column uniqueness rule at
+                                       the database level
+@Enumerated(EnumType.STRING)        - store a Java enum as readable text,
+                                       not a number, in the database
+@PathVariable                       - bind a {variable} from the URL path
+                                       to a Java method parameter
+@RabbitListener(queues = ...)       - run this method automatically
+                                       whenever a message arrives on this queue
+
+
+====================================================================
+11. HOW ONE FULL RESERVATION FLOW LOOKS, END TO END
+====================================================================
+
+1. (Elsewhere, in orders-service) confirmOrder() publishes a
+   ReserveStockMessage with routing key "stock.reserve".
+
+2. RabbitMQ delivers it into inventory-service's Q_RESERVE_STOCK queue
+   (because of the binding configured in RabbitMQConfig).
+
+3. InventoryConsumer.handleReserveStock(message) wakes up automatically
+   (Spring's @RabbitListener machinery), logs it, and calls
+   inventoryService.reserveStock(message).
+
+4. InventoryService.reserveStock() runs the greedy warehouse-splitting
+   algorithm described in section 9.4 above, inside one @Transactional block.
+
+5a. SUCCESS: WarehouseStock rows updated, StockReservation rows saved,
+    InventoryPublisher.publishStockReserved(...) sends a message with
+    routing key "stock.reserved" back out to the shared exchange.
+
+5b. FAILURE: nothing is saved, InventoryPublisher.publishStockReservationFailed(...)
+    sends a message with routing key "stock.reservation.failed" instead.
+
+6. RabbitMQ routes whichever message got sent into orders-service's
+   corresponding queue, where ITS OWN @RabbitListener/consumer reacts -
+   but that is orders-service's code, a completely separate microservice
+   with its own separate database, only connected to inventory-service
+   through this asynchronous message exchange.
+
+
+====================================================================
+12. exception/  (NEW - GLOBAL EXCEPTION HANDLING LAYER)
+====================================================================
+
+Three new files, same pattern as billing-service (see its
+BILLING_SERVICE_EXPLAINED.txt section 17 for the full annotation
+breakdown - only the inventory-specific differences are covered here):
+
+    exception/ResourceNotFoundException.java  -> mapped to HTTP 404
+    exception/ConflictException.java          -> mapped to HTTP 409
+    exception/GlobalExceptionHandler.java     -> the @RestControllerAdvice
+
+WHAT CHANGED IN InventoryService.java:
+  Three throw sites, all previously plain IllegalArgumentException,
+  now use the correct semantic exception:
+
+    getItemState(itemCode)        -> ResourceNotFoundException
+      ("Item not found: ...")        the item genuinely doesn't exist -> 404
+
+    newItem(request)              -> ConflictException
+      ("Item already exists: ...")   the request conflicts with existing
+                                      data (duplicate item code) -> 409
+
+    receptionOfGoods(request)     -> ResourceNotFoundException
+      ("Item not found: ...")        a line item references an item code
+                                      that was never created -> 404
+
+WHY TWO DIFFERENT EXCEPTION TYPES FOR WHAT USED TO BE ONE?
+  Before this change, BOTH "item not found" and "item already exists"
+  threw the exact same IllegalArgumentException type, which meant a
+  generic handler couldn't tell them apart to pick the right HTTP status
+  - both would have ended up as either the same wrong status, or forced
+  ugly string-matching on the exception message. Splitting them into
+  ResourceNotFoundException (404 - "that thing doesn't exist") and
+  ConflictException (409 - "that thing already exists / isn't in the
+  right state") lets GlobalExceptionHandler map each to the semantically
+  correct HTTP status automatically, based purely on exception TYPE.
+
+WHY reserveStock() and cancelReservation() WEREN'T TOUCHED:
+  Those two methods are only ever invoked by InventoryConsumer (from a
+  RabbitMQ message), never directly by InventoryController. An exception
+  escaping a @RabbitListener method doesn't produce an HTTP response at
+  all - GlobalExceptionHandler only intercepts exceptions thrown from
+  @RestController methods. reserveStock() already handles its own
+  business failures explicitly anyway (it publishes a
+  StockReservationFailedEvent and returns, rather than throwing).
+
+====================================================================
+END OF FILE
+====================================================================

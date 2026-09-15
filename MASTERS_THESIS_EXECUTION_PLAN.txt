@@ -1,0 +1,909 @@
+MASTER'S THESIS EXECUTION PLAN
+TOPIC: RELIABILITY AND FAULT TOLERANCE OF A MICROSERVICE-BASED WMS
+
+PURPOSE OF THIS FILE
+This file turns the thesis idea into an actual execution plan for THIS project.
+It assumes:
+  - you keep the existing 3-service WMS as the experimental system
+  - you do NOT add new business features, new public APIs, or new business RabbitMQ flows
+  - you focus only on reliability, fault tolerance, observability, deployment, and experiments
+  - you want a scope that is realistic for a 50-60 page Master's thesis
+
+IMPORTANT DECISION ABOUT OBSERVABILITY
+Yes, you can use Spring Boot Actuator and NOT use Prometheus, Grafana, Loki, or ELK.
+That is acceptable for a Master's thesis IF you are disciplined about collecting and saving data.
+
+For this thesis, a sufficient lightweight measurement stack is:
+  1. Spring Boot Actuator endpoints from each service
+  2. application logs from each service
+  3. RabbitMQ Management UI / HTTP API data
+  4. kubectl events, pod status, restart counts, and logs
+  5. simple CSV or TXT files where you manually store each experiment run's results
+
+You do NOT need a full monitoring platform unless your mentor explicitly asks for one.
+
+
+====================================================================
+0. WHAT YOU ARE ACTUALLY TRYING TO PROVE
+====================================================================
+
+This thesis should NOT say:
+  "I added Kubernetes and some resilience libraries to my WMS."
+
+It SHOULD say:
+  "I experimentally evaluated how selected reliability and fault-tolerance
+   mechanisms affect availability, message reliability, latency, and recovery
+   behavior in an existing RabbitMQ-based Spring Boot microservice WMS."
+
+That means every technical change must exist for one of these reasons:
+  - to create a baseline
+  - to inject a fault
+  - to collect measurements
+  - to compare baseline vs improved configuration
+
+
+====================================================================
+1. FINAL THESIS SCOPE
+====================================================================
+
+Do ONLY these 3 experiment groups.
+
+EXPERIMENT GROUP 1: Kubernetes recovery and replication
+Question:
+  How do replication and Kubernetes recovery mechanisms affect service
+  availability and recovery time when a microservice crashes?
+
+Mechanisms:
+  - Kubernetes Deployments
+  - 1 replica vs 3 replicas
+  - liveness probe
+  - readiness probe
+
+Fault:
+  - deliberately kill one service pod during workload
+
+
+EXPERIMENT GROUP 2: RabbitMQ consumer reliability
+Question:
+  How do acknowledgement strategy, retry handling, dead-letter handling,
+  and idempotent consumption affect message reliability when a consumer fails?
+
+Mechanisms:
+  - acknowledgement control
+  - retry behavior
+  - dead-letter queue
+  - idempotent processing
+
+Fault:
+  - make a consumer fail during message processing
+
+
+EXPERIMENT GROUP 3: Slow or unstable dependency behavior
+Question:
+  How do timeout, retry, and circuit breaker mechanisms affect latency,
+  success rate, and system stability under degraded conditions?
+
+Mechanisms:
+  - timeout
+  - retry
+  - circuit breaker
+
+Fault:
+  - artificial delay or temporary downstream unavailability
+
+
+DO NOT make these core experiments:
+  - full database-failure study
+  - CPU/memory exhaustion as a main chapter
+  - many additional chaos scenarios
+  - large-scale monitoring stack setup
+
+If you have extra time, add only one small sub-scenario:
+  - duplicate-message handling as part of Experiment Group 2
+
+
+====================================================================
+2. CURRENT PROJECT BASELINE
+====================================================================
+
+Based on the current repository:
+  - 3 Spring Boot microservices already exist
+  - RabbitMQ already exists in docker-compose.yml
+  - each service already has its own PostgreSQL database
+  - the business flow already exists and is enough for experiments
+  - there is no need to add more business endpoints or more business messages
+
+Current infrastructure baseline already present:
+  - billing-service
+  - inventory-service
+  - orders-service
+  - rabbitmq:3.13-management
+  - postgres-inventory
+  - postgres-orders
+  - postgres-billing
+
+This is good. It means you should NOT redesign the system.
+You should only extend it around the edges for reliability experiments.
+
+
+====================================================================
+3. RECOMMENDED TOOLS AND ENVIRONMENT
+====================================================================
+
+Use the simplest setup that still supports the experiments.
+
+RECOMMENDED LOCAL ENVIRONMENT ON WINDOWS
+  - Java 17
+  - Maven
+  - Docker Desktop
+  - Docker Compose
+  - Kubernetes enabled in Docker Desktop
+  - kubectl
+  - optional: Postman or curl for manual API calls
+
+WHY THIS CHOICE
+  - you already have docker-compose.yml
+  - Docker Desktop is enough for containers and local Kubernetes
+  - you avoid introducing extra learning overhead from a more complex platform
+
+DO NOT start with a cloud cluster.
+Start and finish locally first.
+
+
+====================================================================
+4. THESIS WORK ORDER AT A HIGH LEVEL
+====================================================================
+
+You should do the work in this exact order:
+
+PHASE 1  Freeze the business scope
+PHASE 2  Make the baseline reproducible
+PHASE 3  Add lightweight observability
+PHASE 4  Define methodology and measurement tables
+PHASE 5  Prepare Kubernetes deployment
+PHASE 6  Run baseline measurements
+PHASE 7  Implement and run Experiment Group 1
+PHASE 8  Implement and run Experiment Group 2
+PHASE 9  Implement and run Experiment Group 3
+PHASE 10 Analyze results
+PHASE 11 Write the thesis from the collected evidence
+
+Do not skip directly to resilience mechanisms.
+If you skip reproducibility and measurement, the thesis becomes weak.
+
+
+====================================================================
+5. PHASE 1 - FREEZE THE BUSINESS SCOPE
+====================================================================
+
+GOAL
+Keep the WMS functionally stable so the experiments remain comparable.
+
+WHAT TO DO
+  1. Decide that all order, stock, payment, and RabbitMQ business flows remain as they are.
+  2. Do not add new business endpoints.
+  3. Do not add new business message types just to make the project look bigger.
+  4. Only allow changes that support reliability, deployment, fault injection, or measurement.
+  5. Write one short note for yourself: "business scope frozen".
+
+WHY THIS MATTERS
+If business behavior changes between experiments, you cannot claim that a
+reliability mechanism caused the observed result.
+
+
+====================================================================
+6. PHASE 2 - MAKE THE BASELINE REPRODUCIBLE
+====================================================================
+
+GOAL
+Make sure the current system can always be started, tested, and reset in a repeatable way.
+
+WHAT TO DO
+  1. Verify that docker-compose.yml starts all containers successfully.
+  2. Verify each service becomes reachable on:
+       inventory-service -> 8081
+       orders-service    -> 8082
+       billing-service   -> 8083
+  3. Verify RabbitMQ Management UI is reachable on 15672.
+  4. Verify each PostgreSQL database is created and reachable.
+  5. Run one complete business scenario manually:
+       create order -> confirm order -> goods reserved -> payment -> completion
+  6. Save the exact steps you used for that scenario.
+  7. Save one clean baseline run log.
+
+WHAT TO SAVE
+  - startup logs of all services
+  - one successful end-to-end scenario log
+  - exact input payloads used in the scenario
+  - any SQL or RabbitMQ observations that confirm consistency
+
+OUTPUT OF THIS PHASE
+You should be able to say:
+  "This is the stable baseline system. It works before any reliability
+   enhancements are introduced."
+
+
+====================================================================
+7. PHASE 3 - ADD LIGHTWEIGHT OBSERVABILITY
+====================================================================
+
+GOAL
+Collect enough data for experiments without building a full monitoring stack.
+
+YES, ACTUATOR IS ENOUGH FOR THIS IF USED WELL.
+
+WHAT TO ADD LATER TO EACH SERVICE
+  1. Spring Boot Actuator dependency
+  2. exposed endpoints for:
+       /actuator/health
+       /actuator/info
+       /actuator/metrics
+       /actuator/metrics/http.server.requests
+       /actuator/metrics/jvm.memory.used
+       /actuator/metrics/process.cpu.usage (if available)
+       /actuator/prometheus is NOT required unless you later decide to scrape metrics
+  3. if needed, custom counters or simple logging around message-processing outcomes
+
+WHAT TO MEASURE USING ACTUATOR
+  - HTTP request count
+  - HTTP latency
+  - error counts by endpoint
+  - JVM memory usage
+  - process CPU usage if exposed
+  - application health state
+
+WHAT TO MEASURE OUTSIDE ACTUATOR
+  - RabbitMQ queue depth, redelivery, ready/unacked counts from management UI/API
+  - pod restarts, pod readiness, events, logs from kubectl
+  - end-to-end workflow correctness from application logs and database state
+
+IMPORTANT LIMITATION
+Actuator alone will not tell you everything about RabbitMQ delivery semantics.
+For message experiments you must also use RabbitMQ Management data and logs.
+
+WHAT TO SAVE
+  - example actuator responses from each service
+  - a list of the exact endpoints you will query during experiments
+  - one simple measurement sheet template before starting experiments
+
+
+====================================================================
+8. PHASE 4 - DEFINE METHODOLOGY BEFORE CODING MORE
+====================================================================
+
+GOAL
+Design the experiments on paper before implementing their mechanisms.
+
+FOR EACH EXPERIMENT, DEFINE THESE ITEMS
+  1. research question
+  2. baseline configuration
+  3. improved configuration
+  4. fault injection method
+  5. workload
+  6. measured variables
+  7. number of repetitions
+  8. analysis method
+
+USE THIS TEMPLATE FOR EVERY EXPERIMENT
+
+Experiment ID:
+Purpose:
+Baseline configuration:
+Improved configuration:
+Fault injected:
+Workload:
+Metrics collected:
+Run duration:
+Number of repetitions:
+Expected trade-off:
+How results will be compared:
+
+MINIMUM REPETITIONS
+  - 5 runs per scenario minimum
+  - 10 runs per scenario if time allows
+
+MINIMUM STATISTICS TO REPORT
+  - mean
+  - median
+  - min
+  - max
+  - standard deviation if possible
+
+
+====================================================================
+9. PHASE 5 - PREPARE KUBERNETES DEPLOYMENT
+====================================================================
+
+GOAL
+Move from Docker Compose baseline to Kubernetes for Experiment Group 1.
+
+SETUP STRATEGY
+Use Docker Compose for the initial baseline runs.
+Use Kubernetes only for the Kubernetes-focused experiments.
+
+WHAT TO PREPARE
+  1. Kubernetes manifests for each microservice Deployment and Service.
+  2. Kubernetes manifests for RabbitMQ and the three PostgreSQL databases.
+  3. environment variables equivalent to the current docker-compose.yml.
+  4. readiness probes and liveness probes for the services.
+  5. replicas field that can be switched between 1 and 3.
+
+HEALTH CHECK DESIGN
+Best practical thesis approach:
+  - use Actuator health endpoint for readiness and liveness probes
+  - expose /actuator/health/readiness and /actuator/health/liveness if you enable probe support
+  - otherwise use /actuator/health as the simpler fallback
+
+WHY THIS IS GOOD FOR THE THESIS
+It directly connects Spring Boot health information to Kubernetes recovery behavior.
+
+OUTPUT OF THIS PHASE
+You should be able to deploy the whole WMS to local Kubernetes and run the same business scenario there.
+
+
+====================================================================
+10. PHASE 6 - RUN THE TRUE BASELINE MEASUREMENTS
+====================================================================
+
+GOAL
+Capture baseline numbers BEFORE advanced reliability mechanisms are added.
+
+BASELINE DEFINITION FOR THE THESIS
+  - current 3 microservices
+  - one instance per service
+  - basic RabbitMQ usage
+  - no retry enhancements yet
+  - no DLQ yet
+  - no idempotency improvements yet
+  - no timeout/circuit breaker improvements yet
+  - minimal or no Kubernetes reliability tuning
+
+WHAT TO DO
+  1. Run the baseline system.
+  2. Apply a fixed workload.
+  3. Record normal latency, success rate, queue behavior, and logs.
+  4. Save this as the reference point for all later comparisons.
+
+WHAT TO SAVE
+  - request success count
+  - request failure count
+  - average and high-percentile latency if you can get it
+  - queue sizes during normal operation
+  - pod/service/container startup times
+  - one consistency check after the run
+
+
+====================================================================
+11. EXPERIMENT GROUP 1 - KUBERNETES RECOVERY AND REPLICATION
+====================================================================
+
+EXPERIMENT 1A - SINGLE REPLICA CRASH
+Purpose:
+  Establish how visible a service crash is when only one replica exists.
+
+Configuration:
+  - 1 replica for the chosen service
+  - readiness and liveness probes enabled
+
+Fault:
+  - kill the pod of one service during active workload
+
+Best service to target first:
+  - orders-service
+Reason:
+  - it orchestrates the central workflow and has both REST and messaging importance
+
+Workload:
+  - continuously send create-order and confirm-order requests
+  - optionally complete payment for a subset of them
+
+Metrics:
+  - failure detection time
+  - pod restart time
+  - readiness recovery time
+  - failed request count during outage
+  - request latency around the crash window
+
+What to observe:
+  - how long clients see errors
+  - whether in-flight requests fail
+  - how fast Kubernetes replaces and readies the pod
+
+
+EXPERIMENT 1B - MULTI-REPLICA CRASH
+Purpose:
+  Compare 1 replica vs 3 replicas under the same crash scenario.
+
+Configuration:
+  - 3 replicas for the same service
+  - same probes
+  - same workload
+
+Fault:
+  - kill 1 pod during workload
+
+Main comparison:
+  - visible downtime with 1 replica vs visible downtime with 3 replicas
+  - latency spikes with 1 replica vs 3 replicas
+  - error rate with 1 replica vs 3 replicas
+  - resource cost difference
+
+Expected conclusion direction:
+  Replication should improve availability but use more resources.
+
+
+HOW TO RUN THIS EXPERIMENT IN PRACTICE
+  1. Deploy with replicas=1.
+  2. Start workload.
+  3. Record current time.
+  4. Delete the selected pod.
+  5. Record:
+       - first visible failure time
+       - new pod start time
+       - readiness time
+       - return-to-normal time
+  6. Repeat 5-10 times.
+  7. Deploy with replicas=3.
+  8. Repeat the exact same steps.
+
+WHAT TO SAVE FOR EACH RUN
+  - kubectl get pods output before fault
+  - kubectl describe pod output after restart
+  - kubectl get events output
+  - service logs around the crash window
+  - workload results
+  - actuator metrics snapshot before/during/after fault
+
+
+====================================================================
+12. EXPERIMENT GROUP 2 - RABBITMQ CONSUMER RELIABILITY
+====================================================================
+
+THIS IS PROBABLY THE MOST IMPORTANT THESIS EXPERIMENT.
+
+MAIN IDEA
+You want to study what happens when a consumer receives a message but fails
+before the processing is safely completed.
+
+BASELINE VERSION
+  - current behavior as close as possible to the existing project
+
+IMPROVED VERSION
+  - acknowledgement strategy chosen deliberately
+  - retry handling
+  - dead-letter queue for poison or repeatedly failing messages
+  - idempotent consumption where needed
+
+CRITICAL FAILURE POINTS TO TEST
+Choose 1 or 2, not all of them.
+
+Recommended failure point A:
+  - consumer receives message
+  - processing starts
+  - service crashes before completion
+
+Recommended failure point B:
+  - database write happens
+  - failure occurs before acknowledgement or before follow-up completion
+
+WHY THESE FAILURE POINTS MATTER
+They reveal whether your system risks:
+  - lost messages
+  - duplicated processing
+  - inconsistent business state
+
+
+EXPERIMENT 2A - BASELINE CONSUMER FAILURE
+Target suggestion:
+  - inventory-service consumer for stock reservation
+or
+  - orders-service consumer handling downstream events
+
+Fault:
+  - inject a controlled failure during message handling
+
+What to measure:
+  - was the message redelivered
+  - was the business effect lost
+  - was the business effect duplicated
+  - what happened to queue depth
+  - how long until final completion, if any
+
+
+EXPERIMENT 2B - IMPROVED CONSUMER RELIABILITY
+Mechanisms to introduce:
+  - manual acknowledgement or controlled acknowledgement behavior
+  - retry attempts with clear limits
+  - dead-letter queue for repeated failure
+  - idempotency guard at the consumer/business boundary
+
+What to compare against baseline:
+  - lost messages
+  - duplicate operations
+  - successful eventual completion
+  - redelivery count
+  - queue buildup
+  - consistency of final database state
+
+
+HOW TO RUN THIS EXPERIMENT IN PRACTICE
+  1. Trigger a workflow that publishes the chosen message.
+  2. Confirm the message reaches the target queue.
+  3. Force the consumer to fail at the selected point.
+  4. Observe RabbitMQ queue state and redelivery behavior.
+  5. Observe resulting database state.
+  6. Repeat for the baseline configuration.
+  7. Add the improved reliability mechanism(s).
+  8. Repeat the exact same fault scenario.
+  9. Compare final message and business outcomes.
+
+WHAT TO SAVE FOR EACH RUN
+  - queue ready count
+  - queue unacked count
+  - redelivery observations
+  - dead-letter queue state, if used
+  - logs from producer and consumer
+  - final DB state for the affected business records
+
+IMPORTANT BUSINESS CORRECTNESS CHECKS
+Depending on the chosen message flow, verify:
+  - stock was not reserved twice
+  - invoice was not created twice
+  - payment effect was not applied twice
+  - shipment request state remained consistent
+
+
+====================================================================
+13. EXPERIMENT GROUP 3 - SLOW OR UNSTABLE DEPENDENCY BEHAVIOR
+====================================================================
+
+PURPOSE
+Study trade-offs between better resilience and worse latency / extra work.
+
+BEST PRACTICAL INTERPRETATION FOR THIS PROJECT
+Introduce delay or temporary unavailability around one service interaction
+path and compare behavior with and without timeout/retry/circuit breaker.
+
+IMPORTANT NOTE
+Because your system is largely message-driven, this experiment does not need
+to look exactly like a classic synchronous REST chain. You only need one clear,
+controlled degraded path and a valid measurement strategy.
+
+SIMPLEST USEFUL VERSION
+  - choose one service interaction or one external dependency path
+  - inject delay
+  - measure how requests and processing times change
+  - add timeout/retry/circuit breaker
+  - measure again
+
+
+EXPERIMENT 3A - DEGRADED BASELINE
+Fault:
+  - artificial delay or temporary unavailability in the chosen path
+
+Metrics:
+  - request latency
+  - timeout/failure count
+  - throughput
+  - backlog growth if messages accumulate
+
+
+EXPERIMENT 3B - RESILIENCE-ENHANCED VERSION
+Mechanisms:
+  - timeout
+  - bounded retry
+  - circuit breaker
+
+Compare:
+  - success rate
+  - p95 or p99 latency if possible
+  - throughput
+  - amount of extra retry traffic
+  - whether the system fails fast instead of hanging
+
+EXPECTED THESIS VALUE
+This experiment gives you the trade-off discussion:
+  - resilience can improve stability
+  - but it may increase latency, complexity, and sometimes resource usage
+
+
+====================================================================
+14. HOW TO COLLECT DATA WITHOUT PROMETHEUS OR GRAFANA
+====================================================================
+
+You need a strict manual data collection discipline.
+
+CREATE A FOLDER STRUCTURE LIKE THIS IN YOUR WORKSPACE LATER
+
+experiments/
+  exp1-k8s-recovery/
+    run-01/
+    run-02/
+  exp2-rabbitmq-reliability/
+    run-01/
+    run-02/
+  exp3-degraded-behavior/
+    run-01/
+    run-02/
+
+INSIDE EACH RUN FOLDER, SAVE THESE FILES
+  - config.txt
+  - workload.txt
+  - actuator-before.txt
+  - actuator-during.txt
+  - actuator-after.txt
+  - rabbitmq-stats.txt
+  - kubectl-events.txt
+  - service-logs.txt
+  - consistency-check.txt
+  - summary.txt
+
+WHAT GOES INTO config.txt
+  - date and time
+  - experiment ID
+  - baseline or improved configuration
+  - number of replicas
+  - probe configuration
+  - retry settings
+  - DLQ enabled or not
+  - timeout settings
+  - circuit breaker settings
+  - commit hash
+
+WHAT GOES INTO workload.txt
+  - which requests or messages were sent
+  - how many
+  - at what rate
+  - for how long
+
+WHAT GOES INTO consistency-check.txt
+  - whether final order states are correct
+  - whether stock values are correct
+  - whether duplicate processing occurred
+  - whether the final business outcome is logically valid
+
+WHAT GOES INTO summary.txt
+  - 5-10 lines only
+  - what fault was injected
+  - what happened
+  - important numbers
+  - whether this run was valid and usable
+
+
+====================================================================
+15. EXACT DATA YOU SHOULD LOOK AT AND SAVE
+====================================================================
+
+SAVE THESE FOR EVERY EXPERIMENT RUN.
+
+A. RUN METADATA
+  - run ID
+  - date/time
+  - scenario name
+  - baseline or improved variant
+  - Git commit hash
+  - workload size
+  - run duration
+
+B. HTTP / ACTUATOR DATA
+  - total requests
+  - successful requests
+  - failed requests
+  - request latency metrics
+  - memory usage snapshot
+  - CPU snapshot if available
+  - health endpoint state
+
+C. RABBITMQ DATA
+  - queue ready count
+  - queue unacked count
+  - redelivery observations
+  - dead-letter count if applicable
+  - messages published and consumed if available
+
+D. KUBERNETES DATA
+  - pod restart count
+  - pod ready transition time
+  - events around fault time
+  - replica count
+  - logs around failure and recovery
+
+E. BUSINESS CORRECTNESS DATA
+  - order state correctness
+  - shipment request state correctness
+  - payment correctness
+  - reservation correctness
+  - duplicate side effects yes/no
+
+
+====================================================================
+16. WHAT YOU SHOULD WRITE WHILE YOU WORK
+====================================================================
+
+Do not wait until the end to start writing.
+
+WRITE THESE THINGS IN PARALLEL WITH IMPLEMENTATION
+  1. architecture description of the current WMS
+  2. baseline limitations
+  3. research questions
+  4. final experiment definitions
+  5. justification for each chosen mechanism
+  6. expected risks and trade-offs
+
+KEEP A SIMPLE RESEARCH NOTEBOOK
+For every meaningful change, note:
+  - what you changed
+  - why you changed it
+  - which experiment it supports
+  - which metrics it affects
+  - what you expect to happen
+
+This will make Chapters 5, 6, 7, and 8 much easier to write.
+
+
+====================================================================
+17. PRACTICAL WEEK-BY-WEEK EXECUTION ORDER
+====================================================================
+
+WEEK 1
+  - freeze scope
+  - verify Docker Compose baseline
+  - run one full workflow manually
+  - document baseline architecture
+
+WEEK 2
+  - add Actuator to all services
+  - decide which metrics/endpoints to use
+  - prepare run folder structure for saved results
+  - write final experiment definitions on paper
+
+WEEK 3
+  - prepare Kubernetes manifests
+  - deploy baseline system to local Kubernetes
+  - confirm one end-to-end scenario works there too
+
+WEEK 4
+  - run baseline measurements
+  - run Experiment Group 1 with 1 replica and 3 replicas
+  - save all raw data
+
+WEEK 5
+  - implement RabbitMQ reliability mechanisms for the selected scenario
+  - run Experiment Group 2 baseline and improved variants
+  - save all raw data
+
+WEEK 6
+  - implement timeout/retry/circuit breaker for the selected degraded scenario
+  - run Experiment Group 3 baseline and improved variants
+  - save all raw data
+
+WEEK 7
+  - clean and organize data
+  - create comparison tables
+  - create charts
+  - verify final consistency checks
+
+WEEK 8+
+  - write results chapter
+  - write discussion chapter
+  - write conclusion chapter
+  - refine introduction and methodology after results are stable
+
+If you have more time, use it for repetition quality and writing quality,
+not for adding more experiments.
+
+
+====================================================================
+18. THESIS CHAPTER MAPPING
+====================================================================
+
+CHAPTER 1 - Introduction
+Write after your research questions are final.
+
+CHAPTER 2 - Theoretical background
+Cover:
+  - microservices
+  - distributed systems reliability
+  - fault tolerance
+  - RabbitMQ basics
+  - Kubernetes basics
+  - resilience patterns
+  - chaos engineering / fault injection
+
+CHAPTER 3 - Related work
+Collect papers while you work. Do not postpone this too long.
+
+CHAPTER 4 - Existing WMS architecture
+Describe this exact system and business flow.
+
+CHAPTER 5 - Proposed reliability architecture
+Describe only the selected mechanisms you actually implemented.
+
+CHAPTER 6 - Experimental methodology
+This chapter must define:
+  - environment
+  - baseline
+  - variables
+  - scenarios
+  - metrics
+  - repetitions
+  - data collection method
+
+CHAPTER 7 - Results
+Pure results first:
+  - tables
+  - charts
+  - raw comparisons
+
+CHAPTER 8 - Discussion
+Interpret:
+  - what improved
+  - what got worse
+  - what trade-offs appeared
+  - what limitations exist
+
+CHAPTER 9 - Conclusion
+Answer each research question directly.
+
+
+====================================================================
+19. WHAT A GOOD FINAL RESULT LOOKS LIKE
+====================================================================
+
+By the end, you want to be able to state something like this:
+
+  - replication and probes improved availability under service crashes
+  - RabbitMQ reliability mechanisms reduced message loss / inconsistent outcomes
+  - timeout/retry/circuit-breaker behavior improved failure handling under degradation
+  - these improvements introduced measurable costs in latency, complexity,
+    and/or resource usage
+
+That is enough for a strong Master's thesis.
+
+
+====================================================================
+20. WHAT NOT TO DO
+====================================================================
+
+Do not do these things:
+  - add new business modules just to make the project look larger
+  - run too many different experiments once each
+  - rely only on screenshots instead of saved raw data
+  - change multiple unrelated things between compared runs
+  - write conclusions before you have repeated measurements
+
+
+====================================================================
+21. YOUR FIRST CONCRETE NEXT ACTIONS
+====================================================================
+
+Start here, in this exact order:
+  1. Verify the current docker-compose baseline works from end to end.
+  2. Write down the exact baseline workflow and payloads you use.
+  3. Add Spring Boot Actuator to all three services.
+  4. Expose and test the health and metrics endpoints.
+  5. Create the experiments/ folder structure for saving run data.
+  6. Define the exact workload you will repeat in every run.
+  7. Prepare Kubernetes manifests and deploy the current baseline.
+  8. Run the first baseline measurement round before adding advanced mechanisms.
+
+If you do these 8 things in order, you will no longer be stuck at the
+"I don't know where to start" stage.
+
+
+====================================================================
+22. FINAL DECISION RULE
+====================================================================
+
+Whenever you are unsure whether to add a new tool, library, mechanism, or
+extra experiment, ask this question:
+
+  "Does this directly help me compare baseline vs improved reliability
+   behavior in one of my 3 chosen experiments?"
+
+If the answer is NO, do not add it.
+
+
+====================================================================
+END OF PLAN
+====================================================================

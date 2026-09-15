@@ -3,6 +3,7 @@ package com.wms.billing.service;
 import com.wms.billing.dto.PayShipmentRequest;
 import com.wms.billing.entity.Payment;
 import com.wms.billing.entity.PaymentReadyShipment;
+import com.wms.billing.exception.ConflictException;
 import com.wms.billing.messaging.BillingPublisher;
 import com.wms.billing.messaging.PaymentConfirmedMessage;
 import com.wms.billing.repository.PaymentReadyShipmentRepository;
@@ -39,7 +40,7 @@ public class BillingService {
         if (!paymentReadyShipmentRepository.existsById(shipmentRequestId)) {
             log.warn("[BILLING] Payment rejected - not ready for payment: shipmentRequestId={}",
                     shipmentRequestId);
-            throw new IllegalStateException(
+            throw new ConflictException(
                     "Shipment request is not ready for payment (not reserved yet, "
                     + "already paid, or cancelled/expired): " + shipmentRequestId);
         }

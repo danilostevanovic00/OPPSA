@@ -2,6 +2,8 @@ package com.wms.orders.service;
 
 import com.wms.orders.dto.*;
 import com.wms.orders.entity.*;
+import com.wms.orders.exception.ConflictException;
+import com.wms.orders.exception.ResourceNotFoundException;
 import com.wms.orders.messaging.*;
 import com.wms.orders.repository.*;
 import org.slf4j.Logger;
@@ -82,10 +84,10 @@ public class OrderService {
     @Transactional
     public ShipmentRequestResponse confirmOrder(String orderId) {
         Order order = orderRepository.findById(orderId)
-                .orElseThrow(() -> new IllegalArgumentException("Order not found: " + orderId));
+                .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + orderId));
 
         if (order.getStatus() != OrderStatus.CREATED) {
-            throw new IllegalStateException("Order cannot be confirmed in status: " + order.getStatus());
+            throw new ConflictException("Order cannot be confirmed in status: " + order.getStatus());
         }
 
         order.setStatus(OrderStatus.CONFIRMED);
@@ -153,7 +155,7 @@ public class OrderService {
     @Transactional
     public void handleStockReserved(StockReservedEvent event) {
         ShipmentRequest sr = shipmentRequestRepository.findById(event.getShipmentRequestId())
-                .orElseThrow(() -> new IllegalArgumentException(
+                .orElseThrow(() -> new ResourceNotFoundException(
                         "ShipmentRequest not found: " + event.getShipmentRequestId()));
         sr.setStatus(ShipmentRequestStatus.PAYMENT_READY);
         shipmentRequestRepository.save(sr);
@@ -176,11 +178,11 @@ public class OrderService {
     @Transactional
     public void handlePaymentConfirmed(PaymentConfirmedMessage message) {
         ShipmentRequest sr = shipmentRequestRepository.findById(message.getShipmentRequestId())
-                .orElseThrow(() -> new IllegalArgumentException(
+                .orElseThrow(() -> new ResourceNotFoundException(
                         "ShipmentRequest not found: " + message.getShipmentRequestId()));
 
         if (sr.getStatus() != ShipmentRequestStatus.PAYMENT_READY) {
-            throw new IllegalStateException(
+            throw new ConflictException(
                     "ShipmentRequest not in PAYMENT_READY status: " + sr.getStatus());
         }
 

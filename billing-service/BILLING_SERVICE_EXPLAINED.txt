@@ -1,0 +1,1125 @@
+====================================================================
+BILLING-SERVICE — FULL BEGINNER EXPLANATION OF EVERY FILE AND ANNOTATION
+====================================================================
+
+This file explains, in plain language, every class and every annotation
+used in billing-service, so you can learn what Spring Boot / JPA /
+Hibernate / RabbitMQ are actually doing under the hood.
+
+Billing-service's job: accept a "payment" for a shipment, save it, and
+tell the Orders service about it - but ONLY if Orders has already told
+Billing that shipment is actually payable. It used to be the smallest,
+simplest service (publish-only, no listeners) - it now ALSO maintains a
+small local cache (synced via RabbitMQ events from orders-service) of
+which shipments are currently payable, making it billing-service's FIRST
+ever RabbitMQ consumer too. Still the smallest of the 3 microservices
+overall (inventory-service, orders-service, billing-service), just no
+longer "publish-only".
+
+
+====================================================================
+1. THE OVERALL SHAPE OF THE PROJECT (LAYERED ARCHITECTURE)
+====================================================================
+
+Every microservice in this project (including billing-service) is split
+into layers. Each layer only talks to the layer directly below it:
+
+    HTTP request
+        |
+        v
+    controller/   <- receives HTTP, calls service, returns HTTP response
+        |
+        v
+    service/      <- the actual business rules / decisions
+        |
+        v
+    repository/   <- talks to the database (nothing else does)
+        |
+        v
+    entity/       <- Java class representing one row of a DB table
+        |
+        v
+    PostgreSQL (the actual database)
+
+    Plus a separate side-branch for async communication:
+
+    service/ --> messaging/ (Publisher) --> RabbitMQ --> other microservice
+
+Folders in billing-service map 1:1 to these layers:
+    controller/  -> BillingController.java
+    service/     -> BillingService.java
+    repository/  -> PaymentRepository.java, PaymentReadyShipmentRepository.java (NEW)
+    entity/      -> Payment.java, PaymentReadyShipment.java (NEW - local cache table)
+    dto/         -> PayShipmentRequest.java
+    messaging/   -> PaymentConfirmedMessage.java, BillingPublisher.java,
+                    ShipmentPaymentReadyEvent.java (NEW),
+                    ShipmentPaymentReadyCancelledEvent.java (NEW),
+                    BillingConsumer.java (NEW - billing's first-ever consumer)
+    config/      -> RabbitMQConfig.java
+    (root)       -> BillingServiceApplication.java
+
+
+====================================================================
+2. BillingServiceApplication.java  (the "main" entry point)
+====================================================================
+
+package com.wms.billing;
+
+@SpringBootApplication
+public class BillingServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(BillingServiceApplication.class, args);
+    }
+}
+
+WHAT IT DOES:
+This is the file that actually starts the whole program. Running
+`java -jar app.jar` calls this main() method.
+
+ANNOTATION: @SpringBootApplication
+  This ONE annotation is actually a shortcut for THREE annotations
+  combined:
+    1. @Configuration        - "this class can define beans" (see below)
+    2. @EnableAutoConfiguration - Spring Boot looks at what's on your
+       classpath (e.g. you have a PostgreSQL driver + spring-boot-starter-
+       data-jpa in pom.xml) and automatically configures things like the
+       database connection, Hibernate, an embedded web server (Tomcat),
+       etc. You never wrote a single line of "connect to Tomcat" code -
+       Spring Boot did it for you because it saw the right dependency.
+    3. @ComponentScan        - tells Spring: "scan this package (com.wms.billing)
+       and every sub-package for classes marked @Component, @Service,
+       @RestController, @Configuration, @Repository etc, and create one
+       instance of each automatically". This is why BillingController,
+       BillingService, etc. all "just work" without you ever writing
+       `new BillingController(...)` anywhere.
+
+WHAT IS A "BEAN"?
+  A "bean" is just a Java object that Spring created and manages for you
+  (instead of you writing `new SomeClass()` yourself). Spring keeps track
+  of every bean in something called the "Application Context" - like a
+  big container/dictionary of all the important objects in your app.
+
+
+====================================================================
+3. controller/BillingController.java  (REST CONTROLLER LAYER)
+====================================================================
+
+package com.wms.billing.controller;
+
+@RestController
+@RequestMapping("/api/billing")
+public class BillingController {
+
+    private final BillingService billingService;
+
+    public BillingController(BillingService billingService) {
+        this.billingService = billingService;
+    }
+
+    @PostMapping("/pay")
+    public ResponseEntity<Void> payShipment(@RequestBody PayShipmentRequest request) {
+        billingService.payShipment(request);
+        return ResponseEntity.ok().build();
+    }
+}
+
+WHAT IT DOES:
+This is the ONLY class in the whole service that knows anything about
+HTTP. Its job is: receive a request, hand it to the service layer, return
+a response. It contains ZERO business logic - notice payShipment() is
+just one line calling billingService.payShipment(request).
+
+ANNOTATION: @RestController
+  A shortcut for @Controller + @ResponseBody. It means:
+    - This class handles incoming HTTP requests (like an old-school MVC controller)
+    - EVERY method's return value is automatically converted to JSON and
+      written directly into the HTTP response body (instead of being
+      treated as the name of an HTML template/view, like classic Spring MVC does).
+
+ANNOTATION: @RequestMapping("/api/billing")
+  Sets the common URL PREFIX for every method in this class. So the
+  @PostMapping("/pay") method below is really reachable at:
+      POST http://localhost:8083/api/billing/pay
+
+ANNOTATION: @PostMapping("/pay")
+  Says: "this Java method handles HTTP POST requests to /pay (relative to
+  the class-level prefix above)". There's also @GetMapping, @PutMapping,
+  @DeleteMapping etc. for other HTTP verbs.
+
+ANNOTATION: @RequestBody
+  On the `request` parameter. Tells Spring: "take the raw JSON text sent
+  in the HTTP request body, and convert it automatically into a
+  PayShipmentRequest Java object". This JSON<->Java conversion is done by
+  a library called Jackson, which Spring Boot wires in automatically.
+
+THE CONSTRUCTOR (public BillingController(BillingService billingService)):
+  This is called "constructor injection" or "dependency injection". Spring
+  sees that BillingController needs a BillingService to do its job, looks
+  in its container of managed beans, finds the one-and-only BillingService
+  bean it already created, and passes it in automatically when it builds
+  BillingController. You never write `new BillingService()` anywhere -
+  Spring does it for you. This is the RECOMMENDED way to wire dependencies
+  in modern Spring (as opposed to older @Autowired-on-a-field style).
+
+THE LOGGER:
+  private static final Logger log = LoggerFactory.getLogger(BillingController.class);
+  This is just SLF4J (a standard Java logging library, comes bundled with
+  Spring Boot). log.info(...) prints a line to the console (which you see
+  in the Docker logs). Nothing magic - just makes debugging/demoing easier.
+
+ResponseEntity<Void>:
+  ResponseEntity wraps an HTTP response (status code + optional body).
+  <Void> means "no response body, just a status code" (200 OK here).
+
+
+====================================================================
+4. dto/PayShipmentRequest.java  (DATA TRANSFER OBJECT)
+====================================================================
+
+package com.wms.billing.dto;
+
+public class PayShipmentRequest {
+    private String shipmentRequestId;
+
+    @JsonFormat(pattern = "yyyy-MM-dd")
+    private LocalDate paymentDate;
+
+    public String getShipmentRequestId() { return shipmentRequestId; }
+    public void setShipmentRequestId(String shipmentRequestId) { ... }
+    public LocalDate getPaymentDate() { return paymentDate; }
+    public void setPaymentDate(LocalDate paymentDate) { ... }
+}
+
+WHAT IS A "DTO"?
+  DTO = "Data Transfer Object". It's just a plain class with fields +
+  getters/setters, and NOTHING else - no business logic, no database
+  annotations. Its ONLY job is to define the exact JSON "shape" that a
+  REST endpoint accepts or returns.
+
+WHY NOT JUST REUSE THE Payment ENTITY DIRECTLY?
+  Because the REST request shape and the database table shape are
+  different concerns. For example, the client should never be allowed to
+  set the internal database id, or the processedAt timestamp - only
+  shipmentRequestId and paymentDate make sense as INPUT. Keeping these as
+  two separate classes means changing your database schema later doesn't
+  automatically (and dangerously) change your public REST API too.
+
+ANNOTATION: @JsonFormat(pattern = "yyyy-MM-dd")
+  Tells Jackson (the JSON library) exactly how to parse a date STRING like
+  "2026-09-06" in the incoming JSON into a Java LocalDate object. Without
+  this, date parsing can be ambiguous or fail depending on format.
+
+GETTERS AND SETTERS (getX() / setX()):
+  Plain Java convention. Fields are `private` (only accessible inside this
+  class), so external code (like Jackson, or Hibernate) reads/writes them
+  through these public methods instead. Jackson specifically requires
+  either public getters/setters OR a no-argument constructor to be able
+  to convert JSON <-> Java objects.
+
+
+====================================================================
+5. service/BillingService.java  (SERVICE LAYER - the business logic)
+====================================================================
+
+package com.wms.billing.service;
+
+@Service
+public class BillingService {
+
+    private final PaymentRepository paymentRepository;
+    private final PaymentReadyShipmentRepository paymentReadyShipmentRepository;
+    private final BillingPublisher publisher;
+
+    public BillingService(PaymentRepository paymentRepository,
+                          PaymentReadyShipmentRepository paymentReadyShipmentRepository,
+                          BillingPublisher publisher) {
+        this.paymentRepository = paymentRepository;
+        this.paymentReadyShipmentRepository = paymentReadyShipmentRepository;
+        this.publisher = publisher;
+    }
+
+    @Transactional
+    public void payShipment(PayShipmentRequest request) {
+        String shipmentRequestId = request.getShipmentRequestId();
+
+        if (!paymentReadyShipmentRepository.existsById(shipmentRequestId)) {
+            throw new IllegalStateException(
+                    "Shipment request is not ready for payment (not reserved yet, "
+                    + "already paid, or cancelled/expired): " + shipmentRequestId);
+        }
+
+        Payment payment = new Payment();
+        payment.setShipmentRequestId(shipmentRequestId);
+        payment.setPaymentDate(request.getPaymentDate());
+        paymentRepository.save(payment);
+
+        paymentReadyShipmentRepository.deleteById(shipmentRequestId);
+
+        publisher.publishPaymentConfirmed(
+                new PaymentConfirmedMessage(shipmentRequestId, request.getPaymentDate()));
+    }
+
+    // Called by BillingConsumer when Orders announces a ShipmentRequest is PAYMENT_READY.
+    @Transactional
+    public void markShipmentReadyForPayment(String shipmentRequestId) {
+        PaymentReadyShipment ready = new PaymentReadyShipment();
+        ready.setShipmentRequestId(shipmentRequestId);
+        paymentReadyShipmentRepository.save(ready);
+    }
+
+    // Called by BillingConsumer when Orders announces a ShipmentRequest expired unpaid.
+    @Transactional
+    public void removeShipmentReadyForPayment(String shipmentRequestId) {
+        paymentReadyShipmentRepository.deleteById(shipmentRequestId);
+    }
+}
+
+WHAT IT DOES:
+This class now does THREE things instead of one, because of the
+"payment-readiness cache" design added on top of the original spec:
+  1. payShipment()                    - the original REST-triggered flow
+  2. markShipmentReadyForPayment()     - reacts to an event FROM orders-service
+  3. removeShipmentReadyForPayment()   - reacts to a DIFFERENT event FROM orders-service
+Methods 2 and 3 exist purely to keep a LOCAL CACHE (the
+PaymentReadyShipment table) in sync with orders-service's
+ShipmentRequest.status, WITHOUT ever querying orders-service's database
+directly or making a synchronous REST call to it. This is the same
+"local cache synced via events" pattern used by orders-service's own
+ItemPricing entity (which mirrors data owned by inventory-service).
+
+ANNOTATION: @Service
+  Functionally identical to @Component (Spring creates one instance/bean
+  of this class), but named "@Service" purely to document its ROLE in the
+  architecture for anyone reading the code (a human-readable label, not a
+  different technical behavior).
+
+ANNOTATION: @Transactional
+  This is one of the most important Spring/database concepts. It wraps
+  the ENTIRE method in a single database transaction:
+    - If the method completes normally, everything it changed in the
+      database gets permanently saved ("committed") all at once.
+    - If ANY exception is thrown anywhere inside the method, EVERYTHING
+      the method changed gets undone ("rolled back"), as if none of it
+      ever happened.
+  Why this matters in payShipment(): imagine payment.save() succeeded,
+  but then deleteById() or publishPaymentConfirmed() somehow crashed.
+  Without @Transactional you could end up with a Payment saved AND the
+  ready-entry still sitting there (or the event never sent), leaving the
+  system in an inconsistent state. With @Transactional, if anything
+  fails, EVERYTHING in the method rolls back together.
+
+WHY payShipment()'S DUPLICATE-PAYMENT CHECK CHANGED (IMPORTANT HISTORY):
+  The ORIGINAL version of this method (see repo memory notes if curious)
+  only checked "does a Payment for this shipmentRequestId already exist?"
+  via paymentRepository.existsByShipmentRequestId(...). That caught
+  duplicate payments, but had NO WAY to know whether the shipment was
+  EVER actually reserved/ready in the first place - Billing had zero
+  visibility into orders-service's ShipmentRequest.status.
+  The NEW version instead checks paymentReadyShipmentRepository.existsById(...).
+  A row there means "orders-service told us, via an event, that this
+  shipment is currently payable". This ONE check now correctly rejects
+  payment in ALL of these cases:
+    - shipment was never reserved (no ItemCreated/StockReserved reply yet)
+    - shipment was ALREADY paid (the row was deleted the first time - see below)
+    - shipment was CANCELLED (Saga compensation - never became ready, so no row existed to begin with)
+    - shipment EXPIRED (row explicitly removed by removeShipmentReadyForPayment)
+
+WHY DELETING THE ROW PREVENTS DOUBLE-PAYMENT (this replaces the old check):
+  paymentReadyShipmentRepository.deleteById(shipmentRequestId);
+  This single line, run immediately after successfully saving the
+  Payment, is what makes a SECOND payment attempt for the same shipment
+  fail: the ready-entry is gone, so the existsById() check at the top of
+  the method returns false, and the whole method throws before ever
+  reaching paymentRepository.save() again. No separate "already paid"
+  check is needed anymore - it falls out naturally from the same check
+  used for readiness. The Payment entity's own unique constraint on
+  shipmentRequestId (see entity section below) remains as a defense-in-
+  depth safety net against a rare race condition (two payment requests
+  arriving at almost the exact same instant).
+
+WHY save() IS SAFE TO CALL EVEN IF THE ROW ALREADY EXISTS:
+  markShipmentReadyForPayment() just calls paymentReadyShipmentRepository.save(ready)
+  without checking if a row already exists first. This is safe because
+  PaymentReadyShipment's @Id (shipmentRequestId) is MANUALLY ASSIGNED, not
+  @GeneratedValue - so Spring Data JPA's save() always treats it as
+  "might already exist" and performs an UPSERT (update if present, insert
+  if not) instead of blindly INSERTing and risking a duplicate-key error.
+  This matters because RabbitMQ only guarantees "at-least-once" delivery -
+  the SAME ShipmentPaymentReadyEvent could theoretically be delivered
+  twice, and this design tolerates that without crashing.
+
+CONSTRUCTOR INJECTION (again):
+  Same pattern as BillingController - Spring automatically supplies the
+  PaymentRepository, PaymentReadyShipmentRepository, and BillingPublisher
+  beans when it builds this BillingService bean.
+
+
+====================================================================
+6. repository/PaymentRepository.java  (REPOSITORY / DAO LAYER)
+====================================================================
+
+package com.wms.billing.repository;
+
+public interface PaymentRepository extends JpaRepository<Payment, Long> {
+}
+
+WHAT IS THIS?
+  This is an INTERFACE - notice there is no actual code/method body
+  anywhere in this file! Spring Data JPA reads this interface at startup
+  and automatically GENERATES a full working implementation behind the
+  scenes (using something called a "dynamic proxy"). You never write SQL
+  by hand for basic operations.
+
+"extends JpaRepository<Payment, Long>":
+  This single line gives you, for FREE, methods like:
+    save(payment)          -> INSERT or UPDATE a row
+    findById(id)           -> SELECT ... WHERE id = ?
+    findAll()               -> SELECT * FROM payments
+    deleteById(id)          -> DELETE ... WHERE id = ?
+    count()                 -> SELECT COUNT(*) ...
+  "Payment" = the entity type this repository manages.
+  "Long" = the type of Payment's @Id field (its primary key).
+
+WHY IS existsByShipmentRequestId GONE NOW?
+  It used to live here and power the OLD duplicate-payment check in
+  BillingService. That check has been replaced entirely by the new
+  PaymentReadyShipmentRepository.existsById(...) check (see section 5
+  above) - the ready-entry being deleted after a successful payment
+  already prevents a second one, so this method was no longer called
+  anywhere and was removed to keep the codebase clean. The database-level
+  UNIQUE constraint on Payment.shipmentRequestId (see entity section)
+  still protects against the same problem as a safety net, just without a
+  friendly Java-level check anymore.
+
+
+====================================================================
+7. repository/PaymentReadyShipmentRepository.java  (REPOSITORY - NEW)
+====================================================================
+
+package com.wms.billing.repository;
+
+public interface PaymentReadyShipmentRepository extends JpaRepository<PaymentReadyShipment, String> {
+}
+
+WHAT IS THIS?
+  The repository for the new local "payment-readiness cache" table. No
+  custom query methods needed at all - existsById() and deleteById()
+  (both FREE from JpaRepository) are literally the only two operations
+  BillingService ever performs on this table (see section 5 above).
+  "PaymentReadyShipment" = the entity type. "String" = the type of its
+  @Id field (shipmentRequestId is a String, unlike Payment's Long id).
+
+
+====================================================================
+8. entity/Payment.java  (JPA ENTITY - the database table, as a Java class)
+====================================================================
+
+package com.wms.billing.entity;
+
+@Entity
+@Table(name = "payments")
+public class Payment {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "shipment_request_id", nullable = false, unique = true, length = 100)
+    private String shipmentRequestId;
+
+    @Column(name = "payment_date", nullable = false)
+    private LocalDate paymentDate;
+
+    @Column(name = "processed_at", nullable = false)
+    private LocalDateTime processedAt = LocalDateTime.now();
+
+    // getters and setters below
+}
+
+WHAT IS A "JPA ENTITY"?
+  JPA = "Jakarta Persistence API" (the Java standard for mapping Java
+  objects to database tables). Hibernate is the actual LIBRARY that
+  implements this standard and does the real work. An "Entity" is a plain
+  Java class that Hibernate treats as "this class = one database table,
+  each field = one column, each object instance = one row".
+
+ANNOTATION: @Entity
+  Marks this class as a JPA entity. Without this, Hibernate ignores the
+  class completely.
+
+ANNOTATION: @Table(name = "payments")
+  Explicitly sets the database table name to "payments". If you omitted
+  this, Hibernate would guess a default name from the class name (usually
+  something like "payment").
+
+ANNOTATION: @Id
+  Marks the "id" field as the PRIMARY KEY of the table - the unique
+  identifier for every row.
+
+ANNOTATION: @GeneratedValue(strategy = GenerationType.IDENTITY)
+  Tells Hibernate: "don't make me supply this value myself - let the
+  DATABASE auto-generate it" (like AUTO_INCREMENT in MySQL, or SERIAL /
+  IDENTITY column in PostgreSQL). So every time you save() a new Payment,
+  the database itself picks the next available number.
+
+ANNOTATION: @Column(...)
+  Configures details about a specific database column:
+    name       = the actual column name in the table
+    nullable   = false means the database will REJECT a row where this
+                 column is empty/NULL (a data-integrity safety rule)
+    unique     = true means the database won't allow two rows to have the
+                 same value in this column - THIS is now the ONLY thing
+                 still guarding against a true duplicate Payment row at
+                 the database level, now that the Java-level
+                 existsByShipmentRequestId() check has been removed (see
+                 section 6) in favor of the PaymentReadyShipment check.
+    length     = maximum number of characters allowed (for String columns)
+
+WHY IS "processedAt" INITIALISED INLINE?
+  private LocalDateTime processedAt = LocalDateTime.now();
+  This just means: whenever a new Payment object is constructed in Java
+  (before it's even saved), this field gets set to "right now" by default.
+  It records exactly when this Payment object was created in memory.
+
+HOW DOES A TABLE ACTUALLY GET CREATED? (NO SQL FILES NEEDED)
+  In application.properties there's a line:
+      spring.jpa.hibernate.ddl-auto=update
+  This tells Hibernate: "look at all my @Entity classes on startup, and
+  automatically CREATE or UPDATE the database tables to match them". This
+  is why this whole project has no manual .sql schema files anywhere -
+  Hibernate generates and maintains the schema directly from these
+  annotated Java classes.
+
+
+====================================================================
+9. entity/PaymentReadyShipment.java  (JPA ENTITY - NEW, the local cache table)
+====================================================================
+
+package com.wms.billing.entity;
+
+@Entity
+@Table(name = "payment_ready_shipments")
+public class PaymentReadyShipment {
+
+    @Id
+    @Column(name = "shipment_request_id", length = 100)
+    private String shipmentRequestId;
+
+    @Column(name = "ready_at", nullable = false)
+    private LocalDateTime readyAt = LocalDateTime.now();
+
+    // getters and setters below
+}
+
+WHAT IS THIS TABLE FOR?
+  This is billing-service's LOCAL CACHE of "which shipment requests are
+  currently payable", synced entirely via RabbitMQ events from
+  orders-service (see sections 11 and 13 below) - NEVER a direct database
+  connection or REST call to orders-service's database. A row existing
+  here means "orders-service told us this ShipmentRequest is
+  PAYMENT_READY and hasn't told us otherwise since". This is the SAME
+  general pattern as orders-service's own ItemPricing entity, which is a
+  local cache of data owned by inventory-service.
+
+WHY IS shipmentRequestId THE @Id, INSTEAD OF A SEPARATE AUTO-GENERATED id?
+  Because this table is ONLY ever queried by "does a row for THIS
+  shipmentRequestId exist?" (existsById) or "delete the row for THIS
+  shipmentRequestId" (deleteById) - it's never listed, paginated, or
+  searched by anything else. Using the natural business key directly as
+  the primary key avoids needing an extra, pointless auto-increment
+  column just to satisfy JPA's requirement for an @Id.
+
+WHY NO @GeneratedValue HERE (unlike Payment.id)?
+  Because the value ISN'T generated by the database - it's a String that
+  ARRIVES from orders-service inside the ShipmentPaymentReadyEvent
+  message. This is exactly why save() safely upserts instead of always
+  inserting (see section 5's explanation) - Spring Data JPA can tell this
+  entity might already exist precisely BECAUSE its @Id is manually
+  assigned rather than database-generated.
+
+
+====================================================================
+10. messaging/PaymentConfirmedMessage.java  (MESSAGE DTO for RabbitMQ)
+====================================================================
+
+package com.wms.billing.messaging;
+
+public class PaymentConfirmedMessage {
+    private String shipmentRequestId;
+
+    @JsonFormat(pattern = "yyyy-MM-dd")
+    private LocalDate paymentDate;
+
+    public PaymentConfirmedMessage() {}
+
+    public PaymentConfirmedMessage(String shipmentRequestId, LocalDate paymentDate) {
+        this.shipmentRequestId = shipmentRequestId;
+        this.paymentDate = paymentDate;
+    }
+    // getters/setters
+}
+
+WHAT IT DOES:
+Same idea as a REST DTO, but this one gets sent over RabbitMQ (a message
+broker) instead of over plain HTTP. It represents "the event that a
+payment was confirmed", sent to orders-service.
+
+WHY TWO CONSTRUCTORS?
+  - The empty one, PaymentConfirmedMessage() {}, exists for Jackson's benefit:
+    when Jackson receives raw JSON bytes and needs to build a Java object
+    out of them, it first calls the no-argument constructor to create an
+    empty/blank object, THEN calls the setters to fill in each field one
+    by one.
+  - The second constructor, taking both fields, is a convenience for OUR
+    OWN code (in BillingPublisher) so we can write:
+        new PaymentConfirmedMessage(id, date)
+    in one line instead of calling setShipmentRequestId(...) and
+    setPaymentDate(...) separately every time.
+
+  IMPORTANT NUANCE - billing-service's OWN copy of this class never
+  actually uses that empty constructor at runtime! Billing-service only
+  ever SERIALIZES this object (Java -> JSON, to send it via
+  BillingPublisher) - it has no @RabbitListener for THIS SPECIFIC message
+  type, so it never needs to deserialize (JSON -> Java) one. (Note:
+  billing-service DOES now have @RabbitListeners for two OTHER message
+  types - see section 13 - just not for this one, since this one is
+  billing-service's own outgoing event.)
+  The place this ACTUALLY matters is orders-service's SEPARATE copy of
+  PaymentConfirmedMessage (com.wms.orders.messaging.PaymentConfirmedMessage) -
+  that class has NO explicit constructors written at all, so Java
+  automatically generates an implicit no-arg one for it. THAT implicit
+  constructor is what Jackson calls every time OrdersConsumer's
+  @RabbitListener method receives this message and needs to turn the
+  incoming JSON bytes back into a Java object.
+  Lesson: these two classes have identical field shapes but completely
+  different real-world usage (one only ever writes JSON, the other only
+  ever reads it) - the same general Jackson rule applies to both, but
+  which specific mechanic (explicit vs. implicit no-arg constructor,
+  actually invoked or not) differs per class depending on how it's used.
+
+IMPORTANT CROSS-SERVICE DETAIL:
+  There is NO shared code/library between billing-service and
+  orders-service. Orders-service has ITS OWN, completely separate copy of
+  a class also called PaymentConfirmedMessage, with the exact same field
+  names (shipmentRequestId, paymentDate). This "contract" between the two
+  services is maintained purely by convention/discipline, not by the Java
+  compiler - if someone renamed a field on one side and forgot the other,
+  Jackson would either silently ignore the field or throw a runtime error
+  the first time a real message was sent.
+
+
+====================================================================
+11. messaging/ShipmentPaymentReadyEvent.java + ShipmentPaymentReadyCancelledEvent.java  (NEW)
+====================================================================
+
+package com.wms.billing.messaging;
+
+public class ShipmentPaymentReadyEvent {
+    private String shipmentRequestId;
+    // getters/setters, no explicit constructors
+}
+
+public class ShipmentPaymentReadyCancelledEvent {
+    private String shipmentRequestId;
+    // getters/setters, no explicit constructors
+}
+
+WHAT THESE ARE:
+Two tiny message DTOs, RECEIVED FROM orders-service (billing-service is
+the LISTENER for both, not the sender - the reverse direction of
+PaymentConfirmedMessage above). Each just carries a shipmentRequestId.
+
+WHY NO EXPLICIT CONSTRUCTORS THIS TIME (unlike PaymentConfirmedMessage)?
+  Because billing-service ONLY EVER DESERIALIZES these two classes (JSON
+  -> Java, arriving from RabbitMQ) - it never needs to construct one
+  itself to send anywhere. Since there's no explicit constructor written,
+  Java automatically generates an implicit public no-arg one, which is
+  exactly what Jackson needs to build the object before calling the
+  setters. (This is the SAME situation as orders-service's own copy of
+  PaymentConfirmedMessage, described in section 10 above - just mirrored:
+  here it's billing-service on the "receiving" side instead.)
+
+MATCHING CLASSES IN ORDERS-SERVICE:
+  orders-service has its OWN separate copies of these two classes
+  (com.wms.orders.messaging.ShipmentPaymentReadyEvent and
+  ShipmentPaymentReadyCancelledEvent) - THOSE ones DO need an explicit
+  constructor taking shipmentRequestId, since orders-service is the one
+  actually constructing and PUBLISHING them (see OrdersPublisher).
+
+
+====================================================================
+12. messaging/BillingPublisher.java  (RABBITMQ PUBLISHER)
+====================================================================
+
+package com.wms.billing.messaging;
+
+@Component
+public class BillingPublisher {
+
+    private final RabbitTemplate rabbitTemplate;
+
+    public BillingPublisher(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    public void publishPaymentConfirmed(PaymentConfirmedMessage message) {
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_PAYMENT_CONFIRMED, message);
+    }
+}
+
+WHAT IT DOES:
+This is the ONLY class in billing-service allowed to actually SEND
+messages onto RabbitMQ. It still only has ONE publish method - Billing
+only ever originates ONE kind of event (PaymentConfirmed); the two NEW
+message types (section 11) flow the OPPOSITE direction (orders-service
+publishes them, billing-service only listens - see section 13).
+
+ANNOTATION: @Component
+  A generic Spring annotation meaning "create one instance of this class
+  and manage it as a bean". @Service, @RestController, @Repository are
+  all more SPECIFIC versions of @Component, used just to communicate
+  intent/role to human readers - @Component is the plain/generic form,
+  used here because "publisher" doesn't have its own dedicated
+  stereotype annotation in Spring.
+
+RabbitTemplate:
+  This is Spring AMQP's (AMQP = the messaging protocol RabbitMQ speaks)
+  helper class for SENDING messages. It's configured/created as a bean in
+  RabbitMQConfig.java (see below) and automatically injected here via the
+  constructor.
+
+rabbitTemplate.convertAndSend(exchange, routingKey, message):
+  Three key RabbitMQ concepts used here:
+    1. EXCHANGE ("wms.topic.exchange")
+       Think of this like a post office. Every message goes IN to an
+       exchange first. It's the single shared entry point that ALL THREE
+       services (inventory, orders, billing) publish their messages into.
+    2. ROUTING KEY ("payment.confirmed")
+       A text "label" attached to the message. The exchange uses this
+       label to decide which queue(s) should receive a copy of the message.
+    3. QUEUE
+       Where the message actually waits until some other service's
+       "Consumer" reads it. This particular message goes to
+       orders-service's "orders.payment-confirmed.queue" (bound to this
+       routing key over there).
+  "convertAndSend" also means: the `message` Java object gets automatically
+  turned into JSON bytes before being sent, using the
+  Jackson2JsonMessageConverter bean configured in RabbitMQConfig.
+
+
+====================================================================
+13. messaging/BillingConsumer.java  (RABBITMQ CONSUMER - NEW, billing's FIRST ONE!)
+====================================================================
+
+package com.wms.billing.messaging;
+
+@Component
+public class BillingConsumer {
+
+    private final BillingService billingService;
+
+    public BillingConsumer(BillingService billingService) {
+        this.billingService = billingService;
+    }
+
+    @RabbitListener(queues = RabbitMQConfig.Q_SHIPMENT_PAYMENT_READY)
+    public void handleShipmentPaymentReady(ShipmentPaymentReadyEvent event) {
+        billingService.markShipmentReadyForPayment(event.getShipmentRequestId());
+    }
+
+    @RabbitListener(queues = RabbitMQConfig.Q_SHIPMENT_PAYMENT_READY_CANCELLED)
+    public void handleShipmentPaymentReadyCancelled(ShipmentPaymentReadyCancelledEvent event) {
+        billingService.removeShipmentReadyForPayment(event.getShipmentRequestId());
+    }
+}
+
+WHAT IS THIS?
+  Until this new design, billing-service had NO Consumer class at all -
+  it only ever SENT messages, never listened for any. This is a big
+  structural change: billing-service now behaves like inventory-service
+  and orders-service in that respect (both send AND receive).
+
+ANNOTATION: @RabbitListener(queues = ...)
+  Tells Spring AMQP: "run this method automatically, on a background
+  thread, whenever a message lands in this specific queue". You NEVER
+  call these methods yourself anywhere in your own code - Spring invokes
+  them for you, completely asynchronously, whenever RabbitMQ delivers a
+  message. The method's PARAMETER TYPE (e.g. ShipmentPaymentReadyEvent)
+  tells Jackson exactly what Java class to deserialize the incoming JSON
+  into.
+
+WHY TWO SEPARATE LISTENERS INSTEAD OF ONE?
+  Because there are two DIFFERENT life-cycle events coming from
+  orders-service that both need to update the SAME PaymentReadyShipment
+  table, but in OPPOSITE directions:
+    - handleShipmentPaymentReady: ShipmentRequest just BECAME payable ->
+      ADD a row (via markShipmentReadyForPayment)
+    - handleShipmentPaymentReadyCancelled: ShipmentRequest STOPPED being
+      payable (it expired unpaid) -> REMOVE the row (via
+      removeShipmentReadyForPayment)
+  Without the second listener, an expired ShipmentRequest's ready-entry
+  would go stale/orphaned in Billing's table forever, letting a very late
+  payment slip through Billing successfully even though orders-service
+  had already given up on it - which would then fail downstream in
+  orders-service's handlePaymentConfirmed() when it saw the wrong status.
+
+EACH METHOD JUST DELEGATES TO BillingService:
+  Same "thin layer" principle used everywhere else in this project -
+  Consumers (and Controllers) never contain real business logic
+  themselves, they just receive input and immediately hand it to the
+  Service layer, which is where the actual decisions/database writes happen.
+
+
+====================================================================
+14. config/RabbitMQConfig.java  (CONFIGURATION LAYER)
+====================================================================
+
+package com.wms.billing.config;
+
+@Configuration
+public class RabbitMQConfig {
+
+    public static final String EXCHANGE = "wms.topic.exchange";
+    public static final String RK_PAYMENT_CONFIRMED = "payment.confirmed";
+
+    // NEW - routing keys Billing now CONSUMES (published by orders-service)
+    public static final String RK_SHIPMENT_PAYMENT_READY = "shipment.payment-ready";
+    public static final String RK_SHIPMENT_PAYMENT_READY_CANCELLED = "shipment.payment-ready-cancelled";
+
+    // NEW - queue names, THIS service's own queues for the two events above
+    public static final String Q_SHIPMENT_PAYMENT_READY = "billing.shipment-payment-ready.queue";
+    public static final String Q_SHIPMENT_PAYMENT_READY_CANCELLED = "billing.shipment-payment-ready-cancelled.queue";
+
+    @Bean
+    public TopicExchange exchange() {
+        return new TopicExchange(EXCHANGE, true, false);
+    }
+
+    // NEW - one Queue bean per incoming message type
+    @Bean public Queue shipmentPaymentReadyQueue()          { return new Queue(Q_SHIPMENT_PAYMENT_READY, true); }
+    @Bean public Queue shipmentPaymentReadyCancelledQueue() { return new Queue(Q_SHIPMENT_PAYMENT_READY_CANCELLED, true); }
+
+    // NEW - one Binding bean per queue, wiring it to the shared exchange
+    // for its specific routing key
+    @Bean
+    public Binding bindShipmentPaymentReady(Queue shipmentPaymentReadyQueue, TopicExchange exchange) {
+        return BindingBuilder.bind(shipmentPaymentReadyQueue).to(exchange).with(RK_SHIPMENT_PAYMENT_READY);
+    }
+
+    @Bean
+    public Binding bindShipmentPaymentReadyCancelled(Queue shipmentPaymentReadyCancelledQueue, TopicExchange exchange) {
+        return BindingBuilder.bind(shipmentPaymentReadyCancelledQueue).to(exchange).with(RK_SHIPMENT_PAYMENT_READY_CANCELLED);
+    }
+
+    @Bean
+    public Jackson2JsonMessageConverter messageConverter(ObjectMapper objectMapper) {
+        Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter(objectMapper);
+        DefaultJackson2JavaTypeMapper typeMapper = new DefaultJackson2JavaTypeMapper();
+        typeMapper.setTypePrecedence(DefaultJackson2JavaTypeMapper.TypePrecedence.INFERRED);
+        converter.setJavaTypeMapper(typeMapper);
+        return converter;
+    }
+
+    @Bean
+    public RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory,
+                                          Jackson2JsonMessageConverter messageConverter) {
+        RabbitTemplate template = new RabbitTemplate(connectionFactory);
+        template.setMessageConverter(messageConverter);
+        return template;
+    }
+
+    // NEW - this is what actually powers BillingConsumer's @RabbitListener
+    // methods. Billing never needed this before since it never consumed
+    // anything; it's the "receiving" counterpart to RabbitTemplate above,
+    // same as in inventory-service/orders-service's RabbitMQConfig.
+    @Bean
+    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+            ConnectionFactory connectionFactory,
+            Jackson2JsonMessageConverter messageConverter) {
+        SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+        factory.setConnectionFactory(connectionFactory);
+        factory.setMessageConverter(messageConverter);
+        return factory;
+    }
+}
+
+WHAT IT DOES:
+This class's whole purpose is to define "@Bean" methods - it configures
+the pieces of infrastructure that BillingPublisher AND (now) BillingConsumer
+depend on. It never gets called directly by your own business code;
+Spring calls these methods once at startup to build the beans, then
+hands them out wherever they're needed (via constructor injection, as
+seen everywhere above).
+
+ANNOTATION: @Configuration
+  Marks this class as a source of @Bean definitions. Internally it's
+  actually a more specialized form of @Component too.
+
+ANNOTATION: @Bean
+  Placed on a METHOD (not a class). Means: "whatever this method returns,
+  register it as a managed Spring bean". So calling exchange() once at
+  startup creates ONE TopicExchange object that lives for the whole
+  lifetime of the application, and can be @Autowired / constructor-
+  injected anywhere else that needs it.
+
+TopicExchange(EXCHANGE, true, false):
+  Creates the RabbitMQ exchange named "wms.topic.exchange". "Topic"
+  exchange type means routing keys COULD use wildcard patterns (like
+  "stock.*"), although this project only ever uses exact-match routing
+  keys. The `true` means "durable" - the exchange survives a RabbitMQ
+  broker restart. The `false` means "not auto-delete" - it won't be
+  removed automatically just because nobody's currently using it.
+
+new Queue(name, durable=true):
+  Represents an actual RabbitMQ queue - where messages wait until a
+  @RabbitListener method reads them. "durable=true" means the queue
+  survives a RabbitMQ broker restart (Spring automatically redeclares it
+  on next startup if missing).
+
+BindingBuilder.bind(queue).to(exchange).with(routingKey):
+  The RULE that connects "if a message arrives at this exchange with
+  this exact routing key, deliver a copy of it into this queue". Without
+  a binding, messages published with that routing key would just be
+  silently dropped - nobody would ever receive them, even with the queue existing.
+
+Jackson2JsonMessageConverter / DefaultJackson2JavaTypeMapper:
+  This part converts Java objects <-> JSON bytes when sending/receiving
+  RabbitMQ messages (parallel to how Jackson does the same thing for
+  REST requests/responses, but for messaging instead of HTTP).
+  The extra "TypePrecedence.INFERRED" configuration solves a real, subtle
+  bug: by default, RabbitMQ's Jackson converter tries to read a special
+  header on the message that says the EXACT Java class name the SENDER
+  used (e.g. "com.wms.orders.messaging.ShipmentPaymentReadyEvent"). But
+  since billing-service has its OWN, separate class with a DIFFERENT
+  package name (com.wms.billing.messaging.ShipmentPaymentReadyEvent),
+  trying to look up the sender's exact class name on the receiver's
+  classpath would fail. "INFERRED" tells it instead: "just use whatever
+  Java type the @RabbitListener method's parameter declares" - which is
+  much more robust across independently-deployed microservices.
+
+RabbitTemplate rabbitTemplate(...):
+  Builds the actual RabbitTemplate bean used by BillingPublisher,
+  wiring in the ConnectionFactory (Spring Boot auto-configures this from
+  application.properties: spring.rabbitmq.host, .port, .username, .password)
+  and the custom message converter configured just above.
+
+SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(...):
+  This is the piece of infrastructure that actually POWERS every
+  @RabbitListener method in BillingConsumer - it's the "receiving"
+  counterpart to RabbitTemplate. Before this design, billing-service
+  didn't need this bean at all, since it had no @RabbitListener methods anywhere.
+
+
+====================================================================
+15. QUICK-REFERENCE GLOSSARY OF EVERY ANNOTATION USED
+====================================================================
+
+@SpringBootApplication  - marks the main class; enables auto-config + component scanning
+@Configuration          - marks a class as a source of @Bean definitions
+@Bean                   - marks a method whose return value becomes a Spring-managed object
+@Component              - generic "let Spring manage an instance of this class"
+@Service                - same as @Component, labeled for the business-logic layer
+@RestController         - @Controller + @ResponseBody; handles HTTP, returns JSON automatically
+@RequestMapping         - sets the base URL path for a controller class
+@PostMapping / @GetMapping etc. - maps a specific HTTP verb+path to a method
+@RequestBody            - parses the incoming JSON body into a Java object parameter
+@Transactional          - wraps a method in one all-or-nothing database transaction
+@Entity                 - marks a class as mapped to a database table
+@Table                  - sets the explicit table name for an @Entity
+@Id                     - marks the primary key field
+@GeneratedValue         - lets the database auto-generate the primary key value
+@Column                 - configures a specific database column's properties
+@JsonFormat             - tells Jackson exactly how to parse/format a date field
+@RabbitListener         - NEW for billing-service - runs a method automatically
+                          whenever a message arrives on the given queue
+
+
+====================================================================
+16. HOW A SINGLE PAYMENT FLOWS THROUGH ALL OF THIS (END TO END)
+====================================================================
+
+This now involves TWO separate flows that meet in the middle: the
+"readiness sync" flow (keeps Billing's local cache correct) and the
+"payment" flow (the original REST-triggered one, now gated by that cache).
+
+--- FLOW A: keeping the PaymentReadyShipment cache in sync ---
+
+A1. (in orders-service) OrderService.handleStockReserved() sets a
+    ShipmentRequest's status to PAYMENT_READY, then calls
+    publisher.publishShipmentPaymentReady(new ShipmentPaymentReadyEvent(sr.getId()))
+    -> sends a message with routing key "shipment.payment-ready"
+
+A2. RabbitMQ delivers it into billing-service's
+    "billing.shipment-payment-ready.queue" (via the binding in
+    section 14 above)
+
+A3. BillingConsumer.handleShipmentPaymentReady(event) wakes up
+    automatically, calls billingService.markShipmentReadyForPayment(id)
+
+A4. A new PaymentReadyShipment row is saved (or safely re-saved/upserted
+    if this is a redelivery) - Billing now "knows" this shipment is payable
+
+--- (the ALTERNATIVE ending to Flow A, if the customer never pays in time) ---
+
+A1'. (in orders-service) the daily @Scheduled job
+     cancelExpiredShipmentRequests() marks an unpaid ShipmentRequest EXPIRED,
+     then calls publisher.publishShipmentPaymentReadyCancelled(...)
+     -> sends a message with routing key "shipment.payment-ready-cancelled"
+
+A2'. RabbitMQ delivers it into billing-service's
+     "billing.shipment-payment-ready-cancelled.queue"
+
+A3'. BillingConsumer.handleShipmentPaymentReadyCancelled(event) calls
+     billingService.removeShipmentReadyForPayment(id)
+
+A4'. The PaymentReadyShipment row is deleted - Billing now correctly
+     refuses to accept a late payment for this shipment, matching
+     orders-service's own decision to give up on it.
+
+--- FLOW B: the actual payment request (only succeeds if Flow A already ran) ---
+
+1. Client sends:  POST /api/billing/pay
+                   { "shipmentRequestId": "abc-123", "paymentDate": "2026-09-06" }
+
+2. BillingController.payShipment(request)
+   - Jackson converts the JSON into a PayShipmentRequest object
+   - calls billingService.payShipment(request)
+
+3. BillingService.payShipment(request)          [inside one @Transactional]
+   - checks paymentReadyShipmentRepository.existsById("abc-123")
+   - if NO row exists -> throws (not ready, already paid, or cancelled/expired)
+   - if a row EXISTS   -> creates and saves a new Payment object
+   - deletes the PaymentReadyShipment row for "abc-123" (blocks a repeat payment)
+   - builds a new PaymentConfirmedMessage("abc-123", "2026-09-06")
+   - calls publisher.publishPaymentConfirmed(message)
+
+4. PaymentRepository.save(payment)
+   - Hibernate generates and runs: INSERT INTO payments (...) VALUES (...)
+
+5. BillingPublisher.publishPaymentConfirmed(message)
+   - sends it to the "wms.topic.exchange" exchange with routing key
+     "payment.confirmed" -> ends up in orders-service's
+     "orders.payment-confirmed.queue"
+
+6. (In orders-service, completely separately) OrdersConsumer picks up the
+   message, and OrderService.handlePaymentConfirmed() creates an Invoice,
+   etc. - a different microservice's code, not billing-service's.
+
+7. Back in step 3, the @Transactional method finishes successfully ->
+   the database transaction COMMITS (Payment saved, ready-entry deleted,
+   both together, or neither if something failed).
+
+8. BillingController returns ResponseEntity.ok().build() -> client
+   receives HTTP 200 OK with no body.
+
+That's the entire life of one payment now - across TWO coordinated
+event flows and every layer of billing-service.
+
+
+====================================================================
+17. exception/  (NEW - GLOBAL EXCEPTION HANDLING LAYER)
+====================================================================
+
+Three new files:
+
+    exception/ResourceNotFoundException.java
+    exception/ConflictException.java
+    exception/GlobalExceptionHandler.java
+
+WHAT PROBLEM DOES THIS SOLVE?
+  Before this, BillingService.payShipment() threw a plain
+  IllegalStateException when a shipment wasn't ready for payment. With
+  NO handler catching it, Spring's DEFAULT behavior kicks in: it returns
+  HTTP 500 Internal Server Error with a generic (or sometimes overly
+  detailed, stack-trace-leaking) error body - even though "shipment not
+  ready for payment" is really the CLIENT's fault (a bad/premature
+  request), which should be HTTP 409 Conflict, not a server-side crash.
+  Returning 500 for client mistakes is both misleading to API consumers
+  and a minor information-disclosure risk if stack traces leak out.
+
+exception/ResourceNotFoundException.java and ConflictException.java:
+  Two small custom RuntimeException subclasses - each just wraps a
+  String message. They exist purely to give the exception a MEANING
+  ("this specific kind of failure happened") instead of reusing generic
+  built-in types like IllegalStateException, which Java/Spring also use
+  internally for unrelated things. Being unchecked (extend
+  RuntimeException, not Exception), callers are NOT forced to
+  try/catch or declare "throws" everywhere - they can be thrown deep
+  inside BillingService and simply bubble all the way up to the
+  controller layer untouched.
+
+exception/GlobalExceptionHandler.java:
+
+    @RestControllerAdvice
+    public class GlobalExceptionHandler {
+
+        @ExceptionHandler(ResourceNotFoundException.class)
+        public ProblemDetail handleNotFound(ResourceNotFoundException ex) {
+            return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+        }
+
+        @ExceptionHandler(ConflictException.class)
+        public ProblemDetail handleConflict(ConflictException ex) {
+            return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        }
+
+        @ExceptionHandler(Exception.class)
+        public ProblemDetail handleUnexpected(Exception ex) {
+            return ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "...");
+        }
+        // + handlers for HttpMessageNotReadableException and IllegalArgumentException
+    }
+
+ANNOTATION: @RestControllerAdvice
+  A GLOBAL, cross-cutting version of @RestController. Instead of
+  handling ONE controller's requests, this class intercepts exceptions
+  thrown by EVERY @RestController in the whole billing-service
+  application - BillingController never needs its own try/catch blocks
+  at all. Spring finds this class automatically (it's just another
+  @Component-style bean) and registers it as the app's single exception
+  interception point.
+
+ANNOTATION: @ExceptionHandler(SomeException.class)
+  On a method inside a @RestControllerAdvice class, this says: "whenever
+  a controller method (anywhere in the app) throws SomeException (or any
+  of its subclasses) and lets it propagate uncaught, run THIS method
+  instead, and use ITS return value as the actual HTTP response". Spring
+  picks the MOST SPECIFIC matching handler if several could apply.
+
+WHAT IS ProblemDetail?
+  A built-in Spring 6 / Spring Boot 3 class implementing RFC 7807
+  ("Problem Details for HTTP APIs") - a standardized JSON shape for
+  error responses, e.g.:
+      {
+        "type": "about:blank",
+        "title": "Conflict",
+        "status": 409,
+        "detail": "Shipment request is not ready for payment: abc-123"
+      }
+  Using this instead of a hand-rolled error DTO means every error from
+  every endpoint in every one of these three services now has the SAME
+  predictable JSON shape, which any API consumer (or API gateway/monitoring
+  tool) can parse generically without needing custom per-endpoint logic.
+
+WHY THE FINAL catch-all @ExceptionHandler(Exception.class)?
+  This is a SECURITY-RELEVANT safety net. Without it, any truly
+  unexpected bug (a NullPointerException, a database connectivity
+  failure, etc.) would let Spring Boot's default error handling take
+  over, which can include internal details in its response depending on
+  configuration. Catching Exception.class here guarantees EVERY error
+  path returns the same safe, generic "please try again later" message
+  to the client (still HTTP 500), while the FULL exception with stack
+  trace is still logged server-side via log.error(...) for debugging -
+  the client never sees internals, but developers reading the logs still
+  can.
+
+WHERE BillingService.java CHANGED:
+  The one throw site in payShipment() now throws
+  `new ConflictException(...)` instead of `new IllegalStateException(...)`.
+  Nothing else about BillingService's logic changed - this is purely
+  about giving the SAME failure a proper HTTP status code on the way out.
+
+====================================================================
+END OF FILE
+====================================================================
+

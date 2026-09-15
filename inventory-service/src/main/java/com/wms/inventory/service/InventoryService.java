@@ -2,6 +2,8 @@ package com.wms.inventory.service;
 
 import com.wms.inventory.dto.*;
 import com.wms.inventory.entity.*;
+import com.wms.inventory.exception.ConflictException;
+import com.wms.inventory.exception.ResourceNotFoundException;
 import com.wms.inventory.messaging.*;
 import com.wms.inventory.repository.*;
 import org.slf4j.Logger;
@@ -52,7 +54,7 @@ public class InventoryService {
 
     public List<WarehouseStockResponse> getItemState(String itemCode) {
         Item item = itemRepository.findById(itemCode)
-                .orElseThrow(() -> new IllegalArgumentException("Item not found: " + itemCode));
+                .orElseThrow(() -> new ResourceNotFoundException("Item not found: " + itemCode));
         return warehouseStockRepository.findByItem(item).stream()
                 .map(ws -> new WarehouseStockResponse(
                         ws.getWarehouseCode(), itemCode,
@@ -64,7 +66,7 @@ public class InventoryService {
     @Transactional
     public void newItem(NewItemRequest request) {
         if (itemRepository.existsById(request.getItemCode())) {
-            throw new IllegalArgumentException("Item already exists: " + request.getItemCode());
+            throw new ConflictException("Item already exists: " + request.getItemCode());
         }
         Item item = new Item();
         item.setItemCode(request.getItemCode());
@@ -90,7 +92,7 @@ public class InventoryService {
 
         for (ReceptionItemRequest itemReq : request.getItems()) {
             Item item = itemRepository.findById(itemReq.getItemCode())
-                    .orElseThrow(() -> new IllegalArgumentException(
+                    .orElseThrow(() -> new ResourceNotFoundException(
                             "Item not found: " + itemReq.getItemCode()));
 
             GoodsReceptionItem receptionItem = new GoodsReceptionItem();
